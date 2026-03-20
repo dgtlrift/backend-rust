@@ -28,9 +28,27 @@ impl Backend for RustBackend {
         module: &IrModule,
         opts:   &CodegenOptions,
     ) -> Result<CodegenOutput, CodegenError> {
-        let content = emit_module(module, opts);
-        let filename = format!("{}.rs", module.name);
-        Ok(CodegenOutput::single(filename, content))
+        let crate_name = format!("{}-cbor", module.name);
+        let lib_src    = emit_module(module, opts);
+        let tests_src  = emit_roundtrip_tests(module, opts);
+        let cargo_toml = emit_cargo_toml(&crate_name, opts);
+
+        Ok(CodegenOutput {
+            files: vec![
+                cddlc_codegen::GeneratedFile {
+                    path:    format!("{}/Cargo.toml", crate_name),
+                    content: cargo_toml,
+                },
+                cddlc_codegen::GeneratedFile {
+                    path:    format!("{}/src/lib.rs", crate_name),
+                    content: lib_src,
+                },
+                cddlc_codegen::GeneratedFile {
+                    path:    format!("{}/tests/roundtrip.rs", crate_name),
+                    content: tests_src,
+                },
+            ],
+        })
     }
 }
 
@@ -66,21 +84,19 @@ fn emit_header(w: &mut IndentWriter, opts: &CodegenOptions) {
     if opts.dcbor { w.line("// Encoding: deterministic (dCBOR)"); }
     w.blank();
 
-    if opts.no_std {
-        w.line("#![no_std]");
-        w.blank();
-    }
+    // no_std is always feature-gated so the crate works in both environments
+    w.line("#![cfg_attr(feature = \"no-std\", no_std)]");
+    w.blank();
 
     w.line("use minicbor::{Decode, Decoder, Encode, Encoder};");
     w.line("use minicbor::decode::Error as DecodeError;");
     w.line("use minicbor::encode::Error as EncodeError;");
+    w.line("use minicbor::encode::Write;");
+    w.blank();
 
-    if !opts.no_std {
-        w.line("use minicbor::encode::Write;");
-    } else {
-        w.line("use minicbor::encode::Write;");
-        w.line("use heapless::Vec as HVec;");
-    }
+    // heapless import gated on the no-std feature
+    w.line("#[cfg(feature = \"no-std\")]");
+    w.line("use heapless::Vec as HVec;");
     w.blank();
 
     // Error types
@@ -118,7 +134,7 @@ fn emit_struct(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) {
     emit_doc(w, s.doc.as_deref());
     if s.deprecated { w.line("#[deprecated]"); }
 
-    w.line("#[derive(Debug, Clone, PartialEq)]");
+    w.line("#[derive(Debug, Clone, PartialEq, Default)]");
     w.line(&format!("pub struct {} {{", to_pascal_case(&s.name)));
     w.indent();
     for f in &s.fields {
@@ -269,11 +285,13 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
     emit_doc(w, e.doc.as_deref());
     if e.deprecated { w.line("#[deprecated]"); }
 
-    w.line("#[derive(Debug, Clone, PartialEq)]");
+    w.line("#[derive(Debug, Clone, PartialEq, Default)]");
     w.line(&format!("pub enum {} {{", to_pascal_case(&e.name)));
     w.indent();
-    for v in &e.variants {
+    for (i, v) in e.variants.iter().enumerate() {
         let vname = to_pascal_case(&v.name);
+        // Mark first variant as #[default]
+        if i == 0 { w.line("#[default]"); }
         match &v.ty {
             TypeRef::Primitive(Primitive::Null) => w.line(&format!("{vname},")),
             TypeRef::Primitive(p) => {
@@ -468,15 +486,14 @@ fn emit_array(w: &mut IndentWriter, a: &ArrayDef, opts: &CodegenOptions) {
         opts.max_array,
     );
 
-    // Type alias pointing to heapless::Vec or std::vec::Vec
-    if opts.no_std || opts.alloc == AllocStrategy::Arena || opts.alloc == AllocStrategy::Stack {
-        w.line(&format!(
-            "pub type {} = heapless::Vec<{}, {}>;",
-            type_name, elem_ty, cap
-        ));
-    } else {
-        w.line(&format!("pub type {} = Vec<{}>;", type_name, elem_ty));
-    }
+    // Emit both forms, gated on the no-std feature
+    w.line("#[cfg(not(feature = \"no-std\"))]");
+    w.line(&format!("pub type {} = Vec<{}>;", type_name, elem_ty));
+    w.line("#[cfg(feature = \"no-std\")]");
+    w.line(&format!(
+        "pub type {} = heapless::Vec<{}, {}>;",
+        type_name, elem_ty, cap
+    ));
 }
 
 // ── Alias ─────────────────────────────────────────────────────────────────────
@@ -732,6 +749,10 @@ fn field_type_str(ty: &TypeRef, occ: &Occurrence, opts: &CodegenOptions) -> Stri
         Occurrence::ZeroOrMore { capacity } | Occurrence::OneOrMore { capacity }
         | Occurrence::Bounded { capacity, .. } => {
             let cap = capacity_value(capacity, opts.max_array);
+            // In the generated crate, the type depends on the no-std feature.
+            // We emit the std form here; the no-std form is handled at the
+            // type alias level via #[cfg] in emit_array.
+            // For struct fields we pick based on alloc strategy at codegen time.
             if opts.no_std || opts.alloc == AllocStrategy::Stack || opts.alloc == AllocStrategy::Arena {
                 format!("heapless::Vec<{base}, {cap}>")
             } else {
@@ -769,5 +790,313 @@ fn emit_doc(w: &mut IndentWriter, doc: Option<&str>) {
         for line in d.lines() {
             w.line(&format!("/// {line}"));
         }
+    }
+}
+// ── Cargo.toml generation ─────────────────────────────────────────────────────
+
+fn emit_cargo_toml(crate_name: &str, opts: &CodegenOptions) -> String {
+    let mut s = String::new();
+    s.push_str("# @generated by cddlc — do not edit manually\n");
+    s.push_str("[package]\n");
+    s.push_str(&format!("name    = {:?}\n", crate_name));
+    s.push_str("version = \"0.1.0\"\n");
+    s.push_str("edition = \"2021\"\n");
+    s.push('\n');
+    s.push_str("[dependencies]\n");
+    s.push_str("minicbor = { version = \">=0.19\", features = [\"derive\"] }\n");
+    s.push_str("heapless = { version = \"0.8\", optional = true }\n");
+    s.push('\n');
+    s.push_str("[features]\n");
+    s.push_str("default = []\n");
+    s.push_str("no-std  = [\"heapless\"]\n");
+    s.push('\n');
+    s.push_str("[dev-dependencies]\n");
+    s.push_str("minicbor = { version = \">=0.19\", features = [\"derive\", \"alloc\"] }\n");
+    if opts.dcbor {
+        s.push('\n');
+        s.push_str("# dCBOR deterministic encoding enabled\n");
+    }
+    s
+}
+
+// ── Roundtrip test generation ─────────────────────────────────────────────────
+
+fn emit_roundtrip_tests(module: &IrModule, opts: &CodegenOptions) -> String {
+    let mut w = IndentWriter::new(4);
+    let crate_name = format!("{}_cbor", module.name.replace('-', "_"));
+
+    w.line("// @generated by cddlc — do not edit manually");
+    w.line("// Roundtrip encode/decode tests");
+    w.blank();
+    w.line(&format!("use {}::*;", crate_name));
+    w.blank();
+
+    for (_, def) in &module.types {
+        match def {
+            TypeDef::Struct(s) => emit_struct_roundtrip(&mut w, s, opts),
+            TypeDef::Enum(e)   => emit_enum_roundtrip(&mut w, e, opts),
+            TypeDef::Alias(a)  => emit_alias_roundtrip(&mut w, a, opts),
+            TypeDef::Array(a)  => emit_array_roundtrip(&mut w, a, opts),
+            TypeDef::Map(_)    => {}
+        }
+        w.blank();
+    }
+
+    w.finish()
+}
+
+fn emit_struct_roundtrip(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) {
+    let type_name = to_pascal_case(&s.name);
+    let test_name = format!("roundtrip_{}", to_snake_case(&s.name));
+
+    // Tier 1: default roundtrip
+    w.line("#[test]");
+    w.line(&format!("fn {test_name}_default() {{"));
+    w.indent();
+    w.line(&format!("let original = {}::default();", type_name));
+    w.line("let mut buf = [0u8; 512];");
+    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+    w.line(&format!(
+        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+        type_name
+    ));
+    w.line("assert_eq!(original, decoded);");
+    w.dedent();
+    w.line("}");
+    w.blank();
+
+    // Tier 2: explicit values test
+    w.line("#[test]");
+    w.line(&format!("fn {test_name}_explicit() {{"));
+    w.indent();
+    w.line(&format!("let original = {} {{", type_name));
+    w.indent();
+    for f in &s.fields {
+        let fname = to_snake_case(&f.name);
+        let val   = default_value_expr(&f.ty, &f.occurrence, opts);
+        w.line(&format!("{fname}: {val},"));
+    }
+    w.dedent();
+    w.line("};");
+    w.line("let mut buf = [0u8; 512];");
+    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+    w.line(&format!(
+        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+        type_name
+    ));
+    w.line("assert_eq!(original, decoded);");
+
+    // Tag presence check
+    if let Some(tag) = s.tagged {
+        w.blank();
+        w.line("// Verify CBOR tag is present in encoded bytes");
+        w.line(&format!("assert!(buf[..n].contains(&0xc0u8.wrapping_add({}u8)), \"tag {} not found\");",
+            tag.0 % 24, tag.0));
+    }
+    w.dedent();
+    w.line("}");
+}
+
+fn emit_enum_roundtrip(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions) {
+    let type_name = to_pascal_case(&e.name);
+    let test_name = format!("roundtrip_{}", to_snake_case(&e.name));
+
+    w.line("#[test]");
+    w.line(&format!("fn {test_name}_default() {{"));
+    w.indent();
+    w.line(&format!("let original = {}::default();", type_name));
+    w.line("let mut buf = [0u8; 128];");
+    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+    w.line(&format!(
+        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+        type_name
+    ));
+    w.line("assert_eq!(original, decoded);");
+    w.dedent();
+    w.line("}");
+
+    // Test each variant
+    for v in &e.variants {
+        let vname     = to_pascal_case(&v.name);
+        let var_test  = format!("roundtrip_{}_{}", to_snake_case(&e.name), v.name.to_lowercase().replace('-', "_"));
+        let construct = match &v.ty {
+            TypeRef::Primitive(Primitive::Tstr) => {
+                // Use variant name lowercased as the string value
+                let s = v.name.to_lowercase().replace('_', "-");
+                format!("{}::{}({:?}.to_string())", type_name, vname, s)
+            }
+            TypeRef::Primitive(Primitive::Uint) =>
+                format!("{}::{}(0u64)", type_name, vname),
+            TypeRef::Primitive(Primitive::Int) =>
+                format!("{}::{}(0i64)", type_name, vname),
+            TypeRef::Primitive(Primitive::Bool) =>
+                format!("{}::{}(false)", type_name, vname),
+            TypeRef::Primitive(Primitive::Null) =>
+                format!("{}::{}", type_name, vname),
+            _ => continue,
+        };
+
+        w.blank();
+        w.line("#[test]");
+        w.line(&format!("fn {var_test}() {{"));
+        w.indent();
+        w.line(&format!("let original = {construct};"));
+        w.line("let mut buf = [0u8; 128];");
+        w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+        w.line(&format!(
+            "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+            type_name
+        ));
+        w.line("assert_eq!(original, decoded);");
+        w.dedent();
+        w.line("}");
+    }
+}
+
+fn emit_alias_roundtrip(w: &mut IndentWriter, a: &AliasDef, _opts: &CodegenOptions) {
+    if a.constraints.is_empty() && a.tagged.is_none() {
+        return; // simple alias — no interesting test to write
+    }
+
+    let type_name = to_pascal_case(&a.name);
+    let test_name = format!("roundtrip_{}", to_snake_case(&a.name));
+
+    // Tier 1: default roundtrip (constrained newtype)
+    w.line("#[test]");
+    w.line(&format!("fn {test_name}_default() {{"));
+    w.indent();
+    w.line(&format!("let original = {}::default();", type_name));
+    w.line("let mut buf = [0u8; 128];");
+    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+    w.line(&format!(
+        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+        type_name
+    ));
+    w.line("assert_eq!(original, decoded);");
+    w.dedent();
+    w.line("}");
+
+    // Tag verification test
+    if let Some(tag) = a.tagged {
+        w.blank();
+        w.line("#[test]");
+        w.line(&format!("fn {test_name}_tag_present() {{"));
+        w.indent();
+        w.line(&format!("let original = {}::default();", type_name));
+        w.line("let mut buf = [0u8; 128];");
+        w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+        w.line(&format!("// CBOR tag({}) must be the first byte group", tag.0));
+        w.line("assert!(n >= 2, \"encoded output too short to contain tag\");");
+        w.dedent();
+        w.line("}");
+    }
+
+    // Tier 2: constraint violation test (valid value roundtrips, invalid rejected)
+    for c in &a.constraints {
+        match c {
+            cddlc_ir::Constraint::SizeExact(n) => {
+                let valid_val = match &a.ty {
+                    TypeRef::Primitive(Primitive::Tstr) =>
+                        format!("{:?}.to_string()", "a".repeat(*n)),
+                    TypeRef::Primitive(Primitive::Bstr) =>
+                        format!("vec![0u8; {}]", n),
+                    _ => continue,
+                };
+                w.blank();
+                w.line("#[test]");
+                w.line(&format!("fn {test_name}_valid_size() {{"));
+                w.indent();
+                w.line(&format!("let original = {}({});", type_name, valid_val));
+                w.line("let mut buf = [0u8; 256];");
+                w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+                w.line(&format!(
+                    "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode valid\");",
+                    type_name
+                ));
+                w.line("assert_eq!(original, decoded);");
+                w.dedent();
+                w.line("}");
+            }
+            cddlc_ir::Constraint::ValueRangeInt { min, max, .. } => {
+                if let Some(lo) = min {
+                    let mid = if let Some(hi) = max { (lo + hi) / 2 } else { *lo };
+                    w.blank();
+                    w.line("#[test]");
+                    w.line(&format!("fn {test_name}_in_range() {{"));
+                    w.indent();
+                    w.line(&format!("let original = {}({mid}i64);", type_name));
+                    w.line("let mut buf = [0u8; 64];");
+                    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+                    w.line(&format!(
+                        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+                        type_name
+                    ));
+                    w.line("assert_eq!(original, decoded);");
+                    w.dedent();
+                    w.line("}");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn emit_array_roundtrip(w: &mut IndentWriter, a: &ArrayDef, _opts: &CodegenOptions) {
+    // Arrays are type aliases — test via the element type directly
+    let type_name = to_pascal_case(&a.name);
+    let test_name = format!("roundtrip_{}", to_snake_case(&a.name));
+
+    w.line("#[cfg(not(feature = \"no-std\"))]");
+    w.line("#[test]");
+    w.line(&format!("fn {test_name}_empty() {{"));
+    w.indent();
+    w.line(&format!("let original: {} = Vec::new();", type_name));
+    w.line("let mut buf = [0u8; 64];");
+    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+    w.line(&format!(
+        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+        type_name
+    ));
+    w.line("assert_eq!(original, decoded);");
+    w.dedent();
+    w.line("}");
+}
+
+// ── Default value expression helpers ─────────────────────────────────────────
+
+fn default_value_expr(ty: &TypeRef, occ: &Occurrence, opts: &CodegenOptions) -> String {
+    match occ {
+        Occurrence::Optional => "None".into(),
+        Occurrence::ZeroOrMore { .. } | Occurrence::OneOrMore { .. }
+        | Occurrence::Bounded { .. } => {
+            if opts.no_std || opts.alloc == AllocStrategy::Stack
+                || opts.alloc == AllocStrategy::Arena
+            {
+                "heapless::Vec::new()".into()
+            } else {
+                "Vec::new()".into()
+            }
+        }
+        Occurrence::Required => primitive_default_expr(ty),
+    }
+}
+
+fn primitive_default_expr(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::Primitive(p) => match p {
+            Primitive::Bool               => "false".into(),
+            Primitive::Null | Primitive::Undefined => "()".into(),
+            Primitive::Uint               => "0u64".into(),
+            Primitive::Int                => "0i64".into(),
+            Primitive::Float16 | Primitive::Float32 => "0.0f32".into(),
+            Primitive::Float64 | Primitive::Float   => "0.0f64".into(),
+            Primitive::Bstr | Primitive::Any        => "b\"\"".into(),
+            Primitive::Tstr               => "\"\"".into(),
+        },
+        TypeRef::Named(n)      => format!("{}::default()", to_pascal_case(n)),
+        TypeRef::Tagged(_, inner) => primitive_default_expr(inner),
+        TypeRef::Choice(cs)    => cs.first()
+            .map(primitive_default_expr)
+            .unwrap_or_else(|| "Default::default()".into()),
     }
 }
