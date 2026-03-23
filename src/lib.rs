@@ -64,12 +64,11 @@ fn emit_module(module: &IrModule, opts: &CodegenOptions) -> String {
     for (name, def) in &module.types {
         w.blank();
         match def {
-            TypeDef::Struct(s) => emit_struct(&mut w, s, opts),
+            TypeDef::Struct(s) => emit_struct(&mut w, s, opts, module),
             TypeDef::Enum(e)   => emit_enum(&mut w, e, opts),
             TypeDef::Array(a)  => emit_array(&mut w, a, opts),
             TypeDef::Alias(a)  => emit_alias(&mut w, a, opts),
             TypeDef::Map(_)    => {
-                // Open maps → alias to Vec<(K,V)> or heapless::Vec
                 w.line(&format!("// Map type '{}' — use ArrayDef for open maps", name));
             }
         }
@@ -130,7 +129,7 @@ fn emit_header(w: &mut IndentWriter, opts: &CodegenOptions) {
 
 // ── Struct ────────────────────────────────────────────────────────────────────
 
-fn emit_struct(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) {
+fn emit_struct(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions, module: &IrModule) {
     emit_doc(w, s.doc.as_deref());
     if s.deprecated { w.line("#[deprecated]"); }
 
@@ -148,16 +147,16 @@ fn emit_struct(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) {
     w.blank();
     emit_struct_encode(w, s, opts);
     w.blank();
-    emit_struct_decode(w, s, opts);
+    emit_struct_decode(w, s, opts, module);
 }
 
 fn emit_struct_encode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) {
     let type_name = to_pascal_case(&s.name);
     let field_count = s.fields.len();
 
-    w.line(&format!("impl<W: Write> Encode<W> for {} {{", type_name));
+    w.line(&format!("impl<W: Write> Encode<W, ()> for {} {{", type_name));
     w.indent();
-    w.line("fn encode<'b>(&self, e: &mut Encoder<W>, _ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
+    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
     w.indent();
 
     // Emit CBOR tag if present
@@ -190,12 +189,12 @@ fn emit_struct_encode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
     w.line("}");
 }
 
-fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) {
+fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions, module: &IrModule) {
     let type_name = to_pascal_case(&s.name);
 
     w.line(&format!("impl<'b> Decode<'b, ()> for {} {{", type_name));
     w.indent();
-    w.line("fn decode(d: &mut Decoder<'b>, _ctx: &mut ()) -> Result<Self, DecodeError> {");
+    w.line("fn decode(d: &mut Decoder<'b>, ctx: &mut ()) -> Result<Self, DecodeError> {");
     w.indent();
 
     // Tag verification
@@ -230,7 +229,7 @@ fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
         let snake = to_snake_case(&f.name);
         w.line(&format!("{:?} => {{", f.name.as_str()));
         w.indent();
-        let decode_expr = decode_expr_for(&f.ty, opts);
+        let decode_expr = decode_expr_for_in_module(&f.ty, opts, Some(module));
         w.line(&format!("let val = {};", decode_expr));
 
         // Inline validation
@@ -285,13 +284,21 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
     emit_doc(w, e.doc.as_deref());
     if e.deprecated { w.line("#[deprecated]"); }
 
-    w.line("#[derive(Debug, Clone, PartialEq, Default)]");
+    // Check if first variant is a unit variant (can use #[derive(Default)] + #[default])
+    let first_is_unit = e.variants.first().map(|v|
+        matches!(&v.ty, TypeRef::Primitive(Primitive::Null))
+    ).unwrap_or(true);
+
+    if first_is_unit {
+        w.line("#[derive(Debug, Clone, PartialEq, Default)]");
+    } else {
+        w.line("#[derive(Debug, Clone, PartialEq)]");
+    }
     w.line(&format!("pub enum {} {{", to_pascal_case(&e.name)));
     w.indent();
     for (i, v) in e.variants.iter().enumerate() {
         let vname = to_pascal_case(&v.name);
-        // Mark first variant as #[default]
-        if i == 0 { w.line("#[default]"); }
+        if i == 0 && first_is_unit { w.line("#[default]"); }
         match &v.ty {
             TypeRef::Primitive(Primitive::Null) => w.line(&format!("{vname},")),
             TypeRef::Primitive(p) => {
@@ -307,17 +314,46 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
     w.dedent();
     w.line("}");
 
+    // If first variant holds data, emit Default manually
+    if !first_is_unit {
+        if let Some(v) = e.variants.first() {
+            let type_name = to_pascal_case(&e.name);
+            let vname     = to_pascal_case(&v.name);
+            w.blank();
+            w.line(&format!("impl Default for {type_name} {{"));
+            w.indent();
+            w.line("fn default() -> Self {");
+            w.indent();
+            let default_inner = match &v.ty {
+                TypeRef::Primitive(Primitive::Uint) => "0u64".into(),
+                TypeRef::Primitive(Primitive::Int)  => "0i64".into(),
+                TypeRef::Primitive(Primitive::Bool) => "false".into(),
+                TypeRef::Primitive(Primitive::Float | Primitive::Float32 |
+                                   Primitive::Float64 | Primitive::Float16) => "0.0".into(),
+                TypeRef::Primitive(Primitive::Tstr) => "String::new()".into(),
+                TypeRef::Primitive(Primitive::Bstr | Primitive::Any) => "Vec::new()".into(),
+                TypeRef::Named(n) => format!("{}::default()", to_pascal_case(n)),
+                _ => "Default::default()".into(),
+            };
+            w.line(&format!("{type_name}::{vname}({default_inner})"));
+            w.dedent();
+            w.line("}");
+            w.dedent();
+            w.line("}");
+        }
+    }
+
     w.blank();
     emit_enum_encode(w, e, opts);
     w.blank();
     emit_enum_decode(w, e, opts);
 }
 
-fn emit_enum_encode(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions) {
+fn emit_enum_encode(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
     let type_name = to_pascal_case(&e.name);
-    w.line(&format!("impl<W: Write> Encode<W> for {} {{", type_name));
+    w.line(&format!("impl<W: Write> Encode<W, ()> for {} {{", type_name));
     w.indent();
-    w.line("fn encode<'b>(&self, e: &mut Encoder<W>, ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
+    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
     w.indent();
 
     if let Some(tag) = e.tagged {
@@ -334,10 +370,18 @@ fn emit_enum_encode(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions) {
                 w.line(&format!("{}::{} => {{ e.null()?; }}", type_vname, vname));
             }
             TypeRef::Primitive(Primitive::Tstr) => {
-                w.line(&format!("{}::{}(s) => {{ e.str(s)?; }}", type_vname, vname));
+                if opts.no_std {
+                    w.line(&format!("{}::{}(s) => {{ e.str(s)?; }}", type_vname, vname));
+                } else {
+                    w.line(&format!("{}::{}(s) => {{ e.str(s.as_str())?; }}", type_vname, vname));
+                }
             }
             TypeRef::Primitive(Primitive::Bstr) => {
-                w.line(&format!("{}::{}(b) => {{ e.bytes(b)?; }}", type_vname, vname));
+                if opts.no_std {
+                    w.line(&format!("{}::{}(b) => {{ e.bytes(b)?; }}", type_vname, vname));
+                } else {
+                    w.line(&format!("{}::{}(b) => {{ e.bytes(b.as_slice())?; }}", type_vname, vname));
+                }
             }
             TypeRef::Primitive(Primitive::Bool) => {
                 w.line(&format!("{}::{}(b) => {{ e.bool(*b)?; }}", type_vname, vname));
@@ -365,7 +409,7 @@ fn emit_enum_encode(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions) {
     w.line("}");
 }
 
-fn emit_enum_decode(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions) {
+fn emit_enum_decode(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
     let type_name = to_pascal_case(&e.name);
     w.line(&format!("impl<'b> Decode<'b, ()> for {} {{", type_name));
     w.indent();
@@ -407,15 +451,14 @@ fn emit_enum_decode(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions) {
         w.line("minicbor::data::Type::String => {");
         w.indent();
         w.line("let s = d.str()?;");
-        // Match string literals
         w.line("match s {");
         w.indent();
         for v in &e.variants {
             if matches!(&v.ty, TypeRef::Primitive(Primitive::Tstr)) {
-                let vname = to_pascal_case(&v.name);
-                // The variant name in snake_case is the CDDL string value
+                let vname    = to_pascal_case(&v.name);
                 let cddl_str = v.name.to_lowercase().replace('_', "-");
-                w.line(&format!("{:?} => Ok({}::{}(s)),", cddl_str, enum_name, vname));
+                let val: &str = if opts.no_std { "s" } else { "s.to_string()" };
+                w.line(&format!("{:?} => Ok({}::{}({val})),", cddl_str, enum_name, vname));
             }
         }
         w.line("_ => Err(DecodeError::message(\"unknown enum variant\")),");
@@ -507,7 +550,7 @@ fn emit_alias(w: &mut IndentWriter, a: &AliasDef, opts: &CodegenOptions) {
     // If there's a tag, wrap in a newtype struct
     if let Some(tag) = a.tagged {
         let inner_ty = typeref_to_rust(&a.ty, opts);
-        w.line("#[derive(Debug, Clone, PartialEq)]");
+        w.line("#[derive(Debug, Clone, PartialEq, Default)]");
         w.line(&format!("pub struct {}(pub {});", type_name, inner_ty));
         w.blank();
         emit_tagged_newtype_encode(w, &type_name, tag, &a.ty, opts);
@@ -520,7 +563,7 @@ fn emit_alias(w: &mut IndentWriter, a: &AliasDef, opts: &CodegenOptions) {
     } else {
         // Constrained alias — newtype with validation
         let inner_ty = typeref_to_rust(&a.ty, opts);
-        w.line("#[derive(Debug, Clone, PartialEq)]");
+        w.line("#[derive(Debug, Clone, PartialEq, Default)]");
         w.line(&format!("pub struct {}(pub {});", type_name, inner_ty));
         w.blank();
         emit_constrained_newtype_encode(w, &type_name, &a.ty, opts);
@@ -538,9 +581,9 @@ fn emit_tagged_newtype_encode(
     inner:     &TypeRef,
     opts:      &CodegenOptions,
 ) {
-    w.line(&format!("impl<W: Write> Encode<W> for {} {{", type_name));
+    w.line(&format!("impl<W: Write> Encode<W, ()> for {} {{", type_name));
     w.indent();
-    w.line("fn encode<'b>(&self, e: &mut Encoder<W>, ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
+    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
     w.indent();
     w.line(&format!("e.tag(minicbor::data::Tag::new({}))?;", tag.0));
     emit_encode_value(w, inner, "self.0", &Occurrence::Required, opts);
@@ -585,9 +628,9 @@ fn emit_constrained_newtype_encode(
     inner:     &TypeRef,
     opts:      &CodegenOptions,
 ) {
-    w.line(&format!("impl<W: Write> Encode<W> for {} {{", type_name));
+    w.line(&format!("impl<W: Write> Encode<W, ()> for {} {{", type_name));
     w.indent();
-    w.line("fn encode<'b>(&self, e: &mut Encoder<W>, ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
+    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
     w.indent();
     emit_encode_value(w, inner, "self.0", &Occurrence::Required, opts);
     w.line("Ok(())");
@@ -679,29 +722,45 @@ fn encode_call_for_primitive(p: &Primitive, expr: &str) -> String {
         Primitive::Int     => format!("e.i64({expr})"),
         Primitive::Float16 | Primitive::Float32 => format!("e.f32({expr})"),
         Primitive::Float64 | Primitive::Float   => format!("e.f64({expr})"),
-        Primitive::Bstr    => format!("e.bytes({expr})"),
-        Primitive::Tstr    => format!("e.str({expr})"),
-        Primitive::Any     => format!("e.bytes({expr})"),
+        // For owned String / Vec<u8>, borrow as &str / &[u8]
+        Primitive::Tstr    => format!("e.str({expr}.as_str())"),
+        Primitive::Bstr    => format!("e.bytes({expr}.as_slice())"),
+        Primitive::Any     => format!("e.bytes({expr}.as_slice())"),
     }
 }
 
 // ── Decode helpers ────────────────────────────────────────────────────────────
 
 fn decode_expr_for(ty: &TypeRef, opts: &CodegenOptions) -> String {
+    decode_expr_for_in_module(ty, opts, None)
+}
+
+fn decode_expr_for_in_module(ty: &TypeRef, opts: &CodegenOptions, module: Option<&IrModule>) -> String {
     match ty {
         TypeRef::Primitive(p) => {
-            format!("d.{}()?", decode_fn_for_primitive(p))
+            let fn_name = decode_fn_for_primitive(p);
+            match p {
+                // Owned String types need .to_string() / .to_vec()
+                Primitive::Tstr if !opts.no_std =>
+                    format!("d.str()?.to_string()"),
+                Primitive::Bstr | Primitive::Any if !opts.no_std =>
+                    format!("d.bytes()?.to_vec()"),
+                _ => format!("d.{fn_name}()?"),
+            }
         }
         TypeRef::Named(n) => {
-            format!("{}::decode(d, ctx)?", to_pascal_case(n))
+            // Array type aliases (Vec<T>) decode via minicbor's blanket impl
+            let is_array = module.and_then(|m| m.get(n))
+                .map(|def| matches!(def, TypeDef::Array(_)))
+                .unwrap_or(false);
+            if is_array {
+                format!("d.decode()?")
+            } else {
+                format!("{}::decode(d, ctx)?", to_pascal_case(n))
+            }
         }
-        TypeRef::Tagged(_, inner) => {
-            // Tag verification is in the inner type's decode impl
-            decode_expr_for(inner, opts)
-        }
-        TypeRef::Choice(_) => {
-            "d.decode()?".into()
-        }
+        TypeRef::Tagged(_, inner) => decode_expr_for_in_module(inner, opts, module),
+        TypeRef::Choice(_) => "d.decode()?".into(),
     }
 }
 
