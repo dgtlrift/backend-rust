@@ -78,7 +78,7 @@ fn test_cargo_toml_crate_name() {
 #[test]
 fn test_cargo_toml_minicbor_version_range() {
     let g = compile("device-id = uint");
-    assert!(g.cargo_toml.contains(">=0.19"));
+    assert!(g.cargo_toml.contains(">=2"));
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn test_struct_decl() {
 #[test]
 fn test_struct_encode_impl() {
     let g = compile("sensor = { id: uint, value: float32 }");
-    assert!(g.lib_rs.contains("impl<W: Write> Encode<W, ()> for Sensor"));
+    assert!(g.lib_rs.contains("impl<C> Encode<C> for Sensor"));
     assert!(g.lib_rs.contains("e.map(2u64)?"));
 }
 
@@ -289,7 +289,7 @@ fn test_string_enum_decl() {
 #[test]
 fn test_string_enum_encode() {
     let g = compile(r#"status = "ok" / "warn""#);
-    assert!(g.lib_rs.contains("impl<W: Write> Encode<W, ()> for Status"));
+    assert!(g.lib_rs.contains("impl<C> Encode<C> for Status"));
     assert!(g.lib_rs.contains("e.str(s.as_str())?"));  // owned String → .as_str()
 }
 

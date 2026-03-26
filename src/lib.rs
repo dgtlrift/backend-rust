@@ -154,9 +154,9 @@ fn emit_struct_encode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
     let type_name = to_pascal_case(&s.name);
     let field_count = s.fields.len();
 
-    w.line(&format!("impl<W: Write> Encode<W, ()> for {} {{", type_name));
+    w.line(&format!("impl<C> Encode<C> for {} {{", type_name));
     w.indent();
-    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
+    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut C) -> Result<(), EncodeError<W::Error>> {");
     w.indent();
 
     // Emit CBOR tag if present
@@ -207,10 +207,15 @@ fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
         w.line("}");
     }
 
-    // Declare Option<T> vars for each field
+    // Declare Option<T> vars for each field.
+    // Optional fields already have their final type (e.g. String), so we don't
+    // double-wrap with Option<Option<T>>; other occurrences use field_type_str.
     for f in &s.fields {
-        let inner_ty = field_type_str(&f.ty, &f.occurrence, opts);
-        w.line(&format!("let mut {}: Option<{}> = None;", to_snake_case(&f.name), inner_ty));
+        let var_ty = match &f.occurrence {
+            Occurrence::Optional => typeref_to_rust(&f.ty, opts),
+            _ => field_type_str(&f.ty, &f.occurrence, opts),
+        };
+        w.line(&format!("let mut {}: Option<{}> = None;", to_snake_case(&f.name), var_ty));
     }
     w.blank();
 
@@ -351,9 +356,9 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
 
 fn emit_enum_encode(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
     let type_name = to_pascal_case(&e.name);
-    w.line(&format!("impl<W: Write> Encode<W, ()> for {} {{", type_name));
+    w.line(&format!("impl<C> Encode<C> for {} {{", type_name));
     w.indent();
-    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
+    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut C) -> Result<(), EncodeError<W::Error>> {");
     w.indent();
 
     if let Some(tag) = e.tagged {
@@ -581,9 +586,9 @@ fn emit_tagged_newtype_encode(
     inner:     &TypeRef,
     opts:      &CodegenOptions,
 ) {
-    w.line(&format!("impl<W: Write> Encode<W, ()> for {} {{", type_name));
+    w.line(&format!("impl<C> Encode<C> for {} {{", type_name));
     w.indent();
-    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
+    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut C) -> Result<(), EncodeError<W::Error>> {");
     w.indent();
     w.line(&format!("e.tag(minicbor::data::Tag::new({}))?;", tag.0));
     emit_encode_value(w, inner, "self.0", &Occurrence::Required, opts);
@@ -628,9 +633,9 @@ fn emit_constrained_newtype_encode(
     inner:     &TypeRef,
     opts:      &CodegenOptions,
 ) {
-    w.line(&format!("impl<W: Write> Encode<W, ()> for {} {{", type_name));
+    w.line(&format!("impl<C> Encode<C> for {} {{", type_name));
     w.indent();
-    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut ()) -> Result<(), EncodeError<W::Error>> {");
+    w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut C) -> Result<(), EncodeError<W::Error>> {");
     w.indent();
     emit_encode_value(w, inner, "self.0", &Occurrence::Required, opts);
     w.line("Ok(())");
@@ -862,7 +867,7 @@ fn emit_cargo_toml(crate_name: &str, opts: &CodegenOptions) -> String {
     s.push_str("edition = \"2021\"\n");
     s.push('\n');
     s.push_str("[dependencies]\n");
-    s.push_str("minicbor = { version = \">=0.19\", features = [\"derive\"] }\n");
+    s.push_str("minicbor = { version = \">=2\", features = [\"derive\"] }\n");
     s.push_str("heapless = { version = \"0.8\", optional = true }\n");
     s.push('\n');
     s.push_str("[features]\n");
@@ -870,7 +875,7 @@ fn emit_cargo_toml(crate_name: &str, opts: &CodegenOptions) -> String {
     s.push_str("no-std  = [\"heapless\"]\n");
     s.push('\n');
     s.push_str("[dev-dependencies]\n");
-    s.push_str("minicbor = { version = \">=0.19\", features = [\"derive\", \"alloc\"] }\n");
+    s.push_str("minicbor = { version = \">=2\", features = [\"derive\", \"alloc\"] }\n");
     if opts.dcbor {
         s.push('\n');
         s.push_str("# dCBOR deterministic encoding enabled\n");
@@ -913,10 +918,10 @@ fn emit_struct_roundtrip(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOpti
     w.line(&format!("fn {test_name}_default() {{"));
     w.indent();
     w.line(&format!("let original = {}::default();", type_name));
-    w.line("let mut buf = [0u8; 512];");
-    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+    w.line("let mut buf = Vec::new();");
+    w.line("minicbor::encode(&original, &mut buf).expect(\"encode\");");
     w.line(&format!(
-        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+        "let decoded: {} = minicbor::decode(&buf).expect(\"decode\");",
         type_name
     ));
     w.line("assert_eq!(original, decoded);");
@@ -937,10 +942,10 @@ fn emit_struct_roundtrip(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOpti
     }
     w.dedent();
     w.line("};");
-    w.line("let mut buf = [0u8; 512];");
-    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+    w.line("let mut buf = Vec::new();");
+    w.line("minicbor::encode(&original, &mut buf).expect(\"encode\");");
     w.line(&format!(
-        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+        "let decoded: {} = minicbor::decode(&buf).expect(\"decode\");",
         type_name
     ));
     w.line("assert_eq!(original, decoded);");
@@ -964,10 +969,10 @@ fn emit_enum_roundtrip(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions
     w.line(&format!("fn {test_name}_default() {{"));
     w.indent();
     w.line(&format!("let original = {}::default();", type_name));
-    w.line("let mut buf = [0u8; 128];");
-    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+    w.line("let mut buf = Vec::new();");
+    w.line("minicbor::encode(&original, &mut buf).expect(\"encode\");");
     w.line(&format!(
-        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+        "let decoded: {} = minicbor::decode(&buf).expect(\"decode\");",
         type_name
     ));
     w.line("assert_eq!(original, decoded);");
@@ -1000,10 +1005,10 @@ fn emit_enum_roundtrip(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions
         w.line(&format!("fn {var_test}() {{"));
         w.indent();
         w.line(&format!("let original = {construct};"));
-        w.line("let mut buf = [0u8; 128];");
-        w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+        w.line("let mut buf = Vec::new();");
+        w.line("minicbor::encode(&original, &mut buf).expect(\"encode\");");
         w.line(&format!(
-            "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+            "let decoded: {} = minicbor::decode(&buf).expect(\"decode\");",
             type_name
         ));
         w.line("assert_eq!(original, decoded);");
@@ -1025,10 +1030,10 @@ fn emit_alias_roundtrip(w: &mut IndentWriter, a: &AliasDef, _opts: &CodegenOptio
     w.line(&format!("fn {test_name}_default() {{"));
     w.indent();
     w.line(&format!("let original = {}::default();", type_name));
-    w.line("let mut buf = [0u8; 128];");
-    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+    w.line("let mut buf = Vec::new();");
+    w.line("minicbor::encode(&original, &mut buf).expect(\"encode\");");
     w.line(&format!(
-        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+        "let decoded: {} = minicbor::decode(&buf).expect(\"decode\");",
         type_name
     ));
     w.line("assert_eq!(original, decoded);");
@@ -1042,8 +1047,8 @@ fn emit_alias_roundtrip(w: &mut IndentWriter, a: &AliasDef, _opts: &CodegenOptio
         w.line(&format!("fn {test_name}_tag_present() {{"));
         w.indent();
         w.line(&format!("let original = {}::default();", type_name));
-        w.line("let mut buf = [0u8; 128];");
-        w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+        w.line("let mut buf = Vec::new();");
+        w.line("minicbor::encode(&original, &mut buf).expect(\"encode\");");
         w.line(&format!("// CBOR tag({}) must be the first byte group", tag.0));
         w.line("assert!(n >= 2, \"encoded output too short to contain tag\");");
         w.dedent();
@@ -1066,8 +1071,8 @@ fn emit_alias_roundtrip(w: &mut IndentWriter, a: &AliasDef, _opts: &CodegenOptio
                 w.line(&format!("fn {test_name}_valid_size() {{"));
                 w.indent();
                 w.line(&format!("let original = {}({});", type_name, valid_val));
-                w.line("let mut buf = [0u8; 256];");
-                w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+                w.line("let mut buf = Vec::new();");
+                w.line("minicbor::encode(&original, &mut buf).expect(\"encode\");");
                 w.line(&format!(
                     "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode valid\");",
                     type_name
@@ -1084,10 +1089,10 @@ fn emit_alias_roundtrip(w: &mut IndentWriter, a: &AliasDef, _opts: &CodegenOptio
                     w.line(&format!("fn {test_name}_in_range() {{"));
                     w.indent();
                     w.line(&format!("let original = {}({mid}i64);", type_name));
-                    w.line("let mut buf = [0u8; 64];");
-                    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+                    w.line("let mut buf = Vec::new();");
+                    w.line("minicbor::encode(&original, &mut buf).expect(\"encode\");");
                     w.line(&format!(
-                        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+                        "let decoded: {} = minicbor::decode(&buf).expect(\"decode\");",
                         type_name
                     ));
                     w.line("assert_eq!(original, decoded);");
@@ -1110,10 +1115,10 @@ fn emit_array_roundtrip(w: &mut IndentWriter, a: &ArrayDef, _opts: &CodegenOptio
     w.line(&format!("fn {test_name}_empty() {{"));
     w.indent();
     w.line(&format!("let original: {} = Vec::new();", type_name));
-    w.line("let mut buf = [0u8; 64];");
-    w.line("let n = minicbor::encode(&original, buf.as_mut()).expect(\"encode\");");
+    w.line("let mut buf = Vec::new();");
+    w.line("minicbor::encode(&original, &mut buf).expect(\"encode\");");
     w.line(&format!(
-        "let decoded: {} = minicbor::decode(&buf[..n]).expect(\"decode\");",
+        "let decoded: {} = minicbor::decode(&buf).expect(\"decode\");",
         type_name
     ));
     w.line("assert_eq!(original, decoded);");
