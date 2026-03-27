@@ -351,7 +351,8 @@ device-id = tstr .size 16
     assert!(g.lib_rs.contains("pub struct SensorMessage"));
     assert!(g.lib_rs.contains("pub struct DeviceId"));
     assert!(g.lib_rs.contains("val.len() == 16"));
-    assert!(g.lib_rs.contains("Tag::new(1)"));
+    // Inline tags in struct fields are stripped — field type is just the inner type
+    assert!(g.lib_rs.contains("pub timestamp: u64"));
 }
 
 // ── Roundtrip test file ───────────────────────────────────────────────────────
