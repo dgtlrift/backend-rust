@@ -152,8 +152,6 @@ fn emit_struct(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions, modul
 
 fn emit_struct_encode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) {
     let type_name = to_pascal_case(&s.name);
-    let field_count = s.fields.len();
-
     w.line(&format!("impl<C> Encode<C> for {} {{", type_name));
     w.indent();
     w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut C) -> Result<(), EncodeError<W::Error>> {");
