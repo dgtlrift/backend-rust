@@ -1027,7 +1027,7 @@ fn emit_roundtrip_tests(module: &IrModule, opts: &CodegenOptions) -> String {
 
     for (_, def) in &module.types {
         match def {
-            TypeDef::Struct(s) => emit_struct_roundtrip(&mut w, s, opts),
+            TypeDef::Struct(s) => emit_struct_roundtrip(&mut w, s, module, opts),
             TypeDef::Enum(e)   => emit_enum_roundtrip(&mut w, e, opts),
             TypeDef::Alias(a)  => emit_alias_roundtrip(&mut w, a, opts),
             TypeDef::Array(a)  => emit_array_roundtrip(&mut w, a, opts),
@@ -1039,7 +1039,7 @@ fn emit_roundtrip_tests(module: &IrModule, opts: &CodegenOptions) -> String {
     w.finish()
 }
 
-fn emit_struct_roundtrip(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) {
+fn emit_struct_roundtrip(w: &mut IndentWriter, s: &StructDef, module: &IrModule, opts: &CodegenOptions) {
     let type_name = to_pascal_case(&s.name);
     let test_name = format!("roundtrip_{}", to_snake_case(&s.name));
 
@@ -1067,7 +1067,28 @@ fn emit_struct_roundtrip(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOpti
     w.indent();
     for f in &s.fields {
         let fname = to_snake_case(&f.name);
-        let val   = default_value_expr(&f.ty, &f.occurrence, opts);
+        // For Named types that are constrained tstr aliases, use a valid string value.
+        let val = match (&f.occurrence, &f.ty) {
+            (Occurrence::Required, TypeRef::Named(n)) => {
+                if let Some(v) = tstr_test_value_for(n, module) {
+                    v
+                } else {
+                    default_value_expr(&f.ty, &f.occurrence, opts)
+                }
+            }
+            (Occurrence::Required, TypeRef::Tagged(_, inner)) => {
+                if let TypeRef::Named(n) = inner.as_ref() {
+                    if let Some(v) = tstr_test_value_for(n, module) {
+                        v
+                    } else {
+                        default_value_expr(&f.ty, &f.occurrence, opts)
+                    }
+                } else {
+                    default_value_expr(&f.ty, &f.occurrence, opts)
+                }
+            }
+            _ => default_value_expr(&f.ty, &f.occurrence, opts),
+        };
         w.line(&format!("{fname}: {val},"));
     }
     w.dedent();
@@ -1280,20 +1301,35 @@ fn default_value_expr(ty: &TypeRef, occ: &Occurrence, opts: &CodegenOptions) -> 
 fn primitive_default_expr(ty: &TypeRef) -> String {
     match ty {
         TypeRef::Primitive(p) => match p {
-            Primitive::Bool               => "false".into(),
+            Primitive::Bool               => "true".into(),
             Primitive::Null | Primitive::Undefined => "()".into(),
-            Primitive::Uint               => "0u64".into(),
-            Primitive::Int                => "0i64".into(),
-            Primitive::Float16 | Primitive::Float32 => "0.0f32".into(),
-            Primitive::Float64 | Primitive::Float   => "0.0f64".into(),
-            Primitive::Bstr | Primitive::Any        => "Vec::new()".into(),
-            Primitive::Tstr               => "String::new()".into(),
+            Primitive::Uint               => "42u64".into(),
+            Primitive::Int                => "-1i64".into(),
+            Primitive::Float16 | Primitive::Float32 => "1.0f32".into(),
+            Primitive::Float64 | Primitive::Float   => "1.0f64".into(),
+            Primitive::Bstr | Primitive::Any        => "vec![0xf6u8]".into(),
+            Primitive::Tstr               => r#""hello".to_string()"#.into(),
         },
         TypeRef::Named(n)      => format!("{}::default()", to_pascal_case(n)),
         TypeRef::Tagged(_, inner) => primitive_default_expr(inner),
         TypeRef::Choice(cs)    => cs.first()
             .map(primitive_default_expr)
             .unwrap_or_else(|| "Default::default()".into()),
+    }
+}
+
+fn tstr_test_value_for(type_name: &str, module: &IrModule) -> Option<String> {
+    match module.types.get(type_name)? {
+        TypeDef::Alias(a) if matches!(&a.ty, TypeRef::Primitive(Primitive::Tstr)) => {
+            let n = a.constraints.iter().find_map(|c| match c {
+                Constraint::SizeExact(n) => Some(*n),
+                Constraint::SizeRange { min: Some(n), .. } => Some(*n),
+                _ => None,
+            })?;
+            let s = "a".repeat(n);
+            Some(format!("{}({:?}.to_string())", to_pascal_case(type_name), s))
+        }
+        _ => None,
     }
 }
 
