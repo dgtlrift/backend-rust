@@ -196,7 +196,10 @@ fn emit_struct_encode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
             w.line(&format!("if let Some(ref v) = {} {{", field_access));
             w.indent();
             w.line(&format!("e.str({:?})?;", f.name.as_str()));
-            emit_encode_typeref(w, &f.ty, "v", opts);
+            // Use (*v) to deref the `&T` produced by `Some(ref v)`.
+            // Primitive encode calls (e.u64, e.f64, …) take T by value;
+            // method calls on named types auto-ref, so (*v).encode() works too.
+            emit_encode_typeref(w, &f.ty, "(*v)", opts);
             w.dedent();
             w.line("}");
         } else {
@@ -802,7 +805,7 @@ fn emit_encode_value(
         Occurrence::Optional => {
             w.line(&format!("if let Some(ref v) = {expr} {{"));
             w.indent();
-            emit_encode_typeref(w, ty, "v", opts);
+            emit_encode_typeref(w, ty, "(*v)", opts);
             w.dedent();
             w.line("} else { e.null()?; }");
         }
