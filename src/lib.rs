@@ -95,6 +95,7 @@ fn emit_header(w: &mut IndentWriter, opts: &CodegenOptions) {
     w.blank();
 
     // heapless import gated on the no-std feature
+    w.line("#[allow(unexpected_cfgs)]");
     w.line("#[cfg(feature = \"no-std\")]");
     w.line("use heapless::Vec as HVec;");
     w.blank();
@@ -153,6 +154,7 @@ fn emit_struct(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions, modul
 
 fn emit_struct_encode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) {
     let type_name = to_pascal_case(&s.name);
+    w.line("#[allow(unused_variables)]");
     w.line(&format!("impl<C> Encode<C> for {} {{", type_name));
     w.indent();
     w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut C) -> Result<(), EncodeError<W::Error>> {");
@@ -198,7 +200,7 @@ fn emit_struct_encode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
             w.line(&format!("e.str({:?})?;", f.name.as_str()));
             // Use (*v) to deref the `&T` produced by `Some(ref v)`.
             // Primitive encode calls (e.u64, e.f64, …) take T by value;
-            // method calls on named types auto-ref, so (*v).encode() works too.
+            // method calls on named types need explicit deref: (*v).encode().
             emit_encode_typeref(w, &f.ty, "(*v)", opts);
             w.dedent();
             w.line("}");
@@ -218,6 +220,7 @@ fn emit_struct_encode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
 fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions, module: &IrModule) {
     let type_name = to_pascal_case(&s.name);
 
+    w.line("#[allow(unused_variables)]");
     w.line(&format!("impl<'b> Decode<'b, ()> for {} {{", type_name));
     w.indent();
     w.line("fn decode(d: &mut Decoder<'b>, ctx: &mut ()) -> Result<Self, DecodeError> {");
@@ -397,6 +400,7 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
 
 fn emit_enum_encode(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
     let type_name = to_pascal_case(&e.name);
+    w.line("#[allow(unused_variables)]");
     w.line(&format!("impl<C> Encode<C> for {} {{", type_name));
     w.indent();
     w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut C) -> Result<(), EncodeError<W::Error>> {");
@@ -472,6 +476,7 @@ fn emit_enum_encode(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
 
 fn emit_enum_decode(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
     let type_name = to_pascal_case(&e.name);
+    w.line("#[allow(unused_variables)]");
     w.line(&format!("impl<'b> Decode<'b, ()> for {} {{", type_name));
     w.indent();
     w.line("fn decode(d: &mut Decoder<'b>, ctx: &mut ()) -> Result<Self, DecodeError> {");
@@ -623,9 +628,13 @@ fn emit_array(w: &mut IndentWriter, a: &ArrayDef, opts: &CodegenOptions) {
         opts.max_array,
     );
 
-    // Emit both forms, gated on the no-std feature
+    // Emit both forms, gated on the no-std feature.
+    // #[allow(unexpected_cfgs)] suppresses the lint when this code is
+    // include!()'d into a crate that doesn't declare the "no-std" feature.
+    w.line("#[allow(unexpected_cfgs)]");
     w.line("#[cfg(not(feature = \"no-std\"))]");
     w.line(&format!("pub type {} = Vec<{}>;", type_name, elem_ty));
+    w.line("#[allow(unexpected_cfgs)]");
     w.line("#[cfg(feature = \"no-std\")]");
     w.line(&format!(
         "pub type {} = heapless::Vec<{}, {}>;",
@@ -712,6 +721,7 @@ fn emit_tagged_newtype_encode(
     inner:     &TypeRef,
     opts:      &CodegenOptions,
 ) {
+    w.line("#[allow(unused_variables)]");
     w.line(&format!("impl<C> Encode<C> for {} {{", type_name));
     w.indent();
     w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut C) -> Result<(), EncodeError<W::Error>> {");
@@ -733,6 +743,7 @@ fn emit_tagged_newtype_decode(
     constraints: &[Constraint],
     opts:        &CodegenOptions,
 ) {
+    w.line("#[allow(unused_variables)]");
     w.line(&format!("impl<'b> Decode<'b, ()> for {} {{", type_name));
     w.indent();
     w.line("fn decode(d: &mut Decoder<'b>, ctx: &mut ()) -> Result<Self, DecodeError> {");
@@ -759,6 +770,7 @@ fn emit_constrained_newtype_encode(
     inner:     &TypeRef,
     opts:      &CodegenOptions,
 ) {
+    w.line("#[allow(unused_variables)]");
     w.line(&format!("impl<C> Encode<C> for {} {{", type_name));
     w.indent();
     w.line("fn encode<W: Write>(&self, e: &mut Encoder<W>, ctx: &mut C) -> Result<(), EncodeError<W::Error>> {");
@@ -778,6 +790,7 @@ fn emit_constrained_newtype_decode(
     constraints: &[Constraint],
     opts:        &CodegenOptions,
 ) {
+    w.line("#[allow(unused_variables)]");
     w.line(&format!("impl<'b> Decode<'b, ()> for {} {{", type_name));
     w.indent();
     w.line("fn decode(d: &mut Decoder<'b>, ctx: &mut ()) -> Result<Self, DecodeError> {");
@@ -847,14 +860,24 @@ fn emit_encode_typeref(w: &mut IndentWriter, ty: &TypeRef, expr: &str, opts: &Co
 }
 
 fn encode_call_for_primitive(p: &Primitive, expr: &str) -> String {
+    // Value-position primitives (e.u64, e.f64, …) take T by value.  When expr is
+    // a deref like (*v) the outer parens are syntactically redundant inside a
+    // function-call argument and trigger the unused_parens lint.  Strip them.
+    // For method-call primitives (Tstr, Bstr) the parens are necessary to bind
+    // the deref before `.as_str()` / `.as_slice()`, so keep expr as-is there.
+    let val = if expr.starts_with("(*") && expr.ends_with(')') {
+        &expr[1..expr.len() - 1]  // (*v) → *v
+    } else {
+        expr
+    };
     match p {
-        Primitive::Bool    => format!("e.bool({expr})"),
+        Primitive::Bool    => format!("e.bool({val})"),
         Primitive::Null | Primitive::Undefined => "e.null()".into(),
-        Primitive::Uint    => format!("e.u64({expr})"),
-        Primitive::Int     => format!("e.i64({expr})"),
-        Primitive::Float16 | Primitive::Float32 => format!("e.f32({expr})"),
-        Primitive::Float64 | Primitive::Float   => format!("e.f64({expr})"),
-        // For owned String / Vec<u8>, borrow as &str / &[u8]
+        Primitive::Uint    => format!("e.u64({val})"),
+        Primitive::Int     => format!("e.i64({val})"),
+        Primitive::Float16 | Primitive::Float32 => format!("e.f32({val})"),
+        Primitive::Float64 | Primitive::Float   => format!("e.f64({val})"),
+        // For owned String / Vec<u8>, use original expr so (*v).as_str() is correct
         Primitive::Tstr    => format!("e.str({expr}.as_str())"),
         Primitive::Bstr    => format!("e.bytes({expr}.as_slice())"),
         Primitive::Any     => format!("e.bytes({expr}.as_slice())"),
@@ -1266,6 +1289,7 @@ fn emit_array_roundtrip(w: &mut IndentWriter, a: &ArrayDef, _opts: &CodegenOptio
     let type_name = to_pascal_case(&a.name);
     let test_name = format!("roundtrip_{}", to_snake_case(&a.name));
 
+    w.line("#[allow(unexpected_cfgs)]");
     w.line("#[cfg(not(feature = \"no-std\"))]");
     w.line("#[test]");
     w.line(&format!("fn {test_name}_empty() {{"));
