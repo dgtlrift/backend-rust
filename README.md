@@ -62,6 +62,12 @@ impl<'b> minicbor::Decode<'b, ()> for Device { … }
 - CBOR encode: writes a definite-length map with string or integer keys.
 - CBOR decode: reads map entries by key; handles optional fields.
 - JSON encode/decode (when `--format json`): `serde::Serialize` + `Deserialize` derives.
+- Field names that are Rust keywords become raw identifiers (`type` → `r#type`; `self`, `Self`,
+  `super`, `crate` → trailing `_`); the wire name is unchanged.
+- Single-literal fields (`cat: "kernel"`): in JSON mode they get a zero-sized marker type that
+  serializes as the literal and rejects other values, so untagged unions of structs decode to
+  the right variant. In CBOR mode the field stays `String`/integer, `Default` fills in the
+  literal, and decode validates it. CBOR unions of named types decode by trying each variant.
 
 ### Enums (`EnumDef`)
 

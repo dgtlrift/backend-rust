@@ -418,3 +418,41 @@ fn test_roundtrip_array_cfg_gated() {
     assert!(g.roundtrip_rs.contains("#[cfg(not(feature = \"no-std\"))]"));
     assert!(g.roundtrip_rs.contains("roundtrip_readings"));
 }
+
+// ── Keywords and literal fields ───────────────────────────────────────────────
+
+const LITERALS: &str = r#"
+record = start / end
+start = { t: uint, cat: "kernel", type: "SimStart" }
+end = { t: uint, type: "SimEnd", reason: "until" / "queue-empty" }
+"#;
+
+fn json_opts() -> CodegenOptions {
+    CodegenOptions { format: cddlc_codegen::Format::Json, ..CodegenOptions::default() }
+}
+
+#[test]
+fn test_keyword_field_is_raw_identifier() {
+    for out in [compile(LITERALS), compile_with_opts(LITERALS, json_opts())] {
+        assert!(out.lib_rs.contains("pub r#type:"), "{}", out.lib_rs);
+        assert!(!out.lib_rs.contains("pub type:"));
+    }
+}
+
+#[test]
+fn test_json_literal_fields_use_markers() {
+    let out = compile_with_opts(LITERALS, json_opts());
+    assert!(out.lib_rs.contains("pub cat: StartCat,"), "{}", out.lib_rs);
+    assert!(out.lib_rs.contains("pub const VALUE: &'static str = \"kernel\";"));
+    assert!(out.lib_rs.contains("#[serde(rename = \"queue-empty\")]"));
+    assert!(!out.lib_rs.contains("Default::default()(String::new())"));
+}
+
+#[test]
+fn test_cbor_literal_enum_uses_literal_strings() {
+    let out = compile(LITERALS);
+    assert!(out.lib_rs.contains("\"queue-empty\" => Ok("), "{}", out.lib_rs);
+    assert!(!out.lib_rs.contains("\"queueempty\""));
+    assert!(out.lib_rs.contains("let mut probe = d.clone();"));
+    assert!(out.lib_rs.contains("cat: \"kernel\".to_string(),"));
+}
