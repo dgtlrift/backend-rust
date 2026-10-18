@@ -456,3 +456,9 @@ fn test_cbor_literal_enum_uses_literal_strings() {
     assert!(out.lib_rs.contains("let mut probe = d.clone();"));
     assert!(out.lib_rs.contains("cat: \"kernel\".to_string(),"));
 }
+
+#[test]
+fn test_json_constrained_alias_constructor() {
+    let out = compile_with_opts("hex = tstr .size 4", json_opts());
+    assert!(out.lib_rs.contains("pub fn new(val: impl Into<String>) -> Result<Self, String> {"), "{}", out.lib_rs);
+}
