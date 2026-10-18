@@ -14,8 +14,94 @@ use cddlc_codegen::{
 };
 use cddlc_ir::{
     AliasDef, ArrayDef, Capacity, CborTag, Constraint, EnumDef, EnumVariant,
-    IrModule, Occurrence, Primitive, StructDef, TypeDef, TypeRef,
+    FieldDef, IrModule, LiteralValue, Occurrence, Primitive, StructDef, TypeDef, TypeRef,
 };
+
+/// Rust keywords (strict, reserved and edition-2024) that cannot be plain identifiers.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+    "extern", "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod",
+    "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
+    "trait", "true", "type", "unsafe", "use", "where", "while", "abstract", "become", "box",
+    "do", "final", "macro", "override", "priv", "try", "typeof", "unsized", "virtual", "yield",
+];
+
+/// A valid Rust identifier for a CDDL field name: keywords become raw identifiers
+/// (`type` → `r#type`), except those that cannot be raw (`self`, `Self`, `super`,
+/// `crate`), which get a trailing underscore. Serde derives strip the `r#`, and the
+/// JSON backend adds an explicit rename whenever the identifier differs.
+fn field_ident(name: &str) -> String {
+    let snake = to_snake_case(name);
+    if !RUST_KEYWORDS.contains(&snake.as_str()) {
+        snake
+    } else if matches!(snake.as_str(), "self" | "Self" | "super" | "crate") {
+        format!("{snake}_")
+    } else {
+        format!("r#{snake}")
+    }
+}
+
+/// The literal a field or variant must equal (`cat: "kernel"` lowers to `.eq "kernel"`).
+fn literal_eq(constraints: &[Constraint]) -> Option<&LiteralValue> {
+    constraints.iter().find_map(|c| match c {
+        Constraint::Eq(v) => Some(v),
+        _ => None,
+    })
+}
+
+/// The literal of a single-value field whose primitive type matches it, if any.
+fn field_literal(f: &FieldDef) -> Option<&LiteralValue> {
+    let lit = literal_eq(&f.constraints)?;
+    let matches_ty = matches!(
+        (&f.ty, lit),
+        (TypeRef::Primitive(Primitive::Tstr), LiteralValue::Text(_))
+            | (TypeRef::Primitive(Primitive::Uint), LiteralValue::Uint(_))
+            | (TypeRef::Primitive(Primitive::Int), LiteralValue::Int(_) | LiteralValue::Uint(_))
+            | (TypeRef::Primitive(Primitive::Bool), LiteralValue::Bool(_))
+    );
+    (matches_ty && matches!(f.occurrence, Occurrence::Required | Occurrence::Optional))
+        .then_some(lit)
+}
+
+/// The string of a string-literal enum variant (`"queue-empty"` in `"until" / "queue-empty"`).
+fn text_literal(v: &EnumVariant) -> Option<&str> {
+    match (&v.ty, literal_eq(&v.constraints)) {
+        (TypeRef::Primitive(Primitive::Tstr), Some(LiteralValue::Text(t))) => Some(t.as_str()),
+        _ => None,
+    }
+}
+
+/// The CDDL string for a `tstr` enum variant: its literal, or (for variants without
+/// one) the historical lowercased-name fallback.
+fn variant_str(v: &EnumVariant) -> String {
+    text_literal(v)
+        .map(str::to_owned)
+        .unwrap_or_else(|| v.name.to_lowercase().replace('_', "-"))
+}
+
+/// A Rust expression for a literal value, as an owned field value.
+fn literal_value_expr(lit: &LiteralValue, no_std: bool) -> String {
+    match lit {
+        LiteralValue::Text(t) if no_std => format!("{t:?}"),
+        LiteralValue::Text(t) => format!("{t:?}.to_string()"),
+        LiteralValue::Uint(n) => format!("{n}u64"),
+        LiteralValue::Int(n)  => format!("{n}i64"),
+        LiteralValue::Bool(b) => b.to_string(),
+        LiteralValue::Float(f) => format!("{f:?}"),
+        LiteralValue::Null => "()".into(),
+        LiteralValue::Bytes(b) => format!("vec!{b:?}"),
+    }
+}
+
+/// Name of the JSON marker type for a literal member, avoiding module type names.
+fn marker_name(owner: &str, member: &str, module: &IrModule) -> String {
+    let base = format!("{}{}", to_pascal_case(owner), to_pascal_case(member));
+    if module.types.keys().any(|k| to_pascal_case(k) == base) {
+        format!("{base}Literal")
+    } else {
+        base
+    }
+}
 
 pub struct RustBackend;
 
@@ -135,16 +221,46 @@ fn emit_struct(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions, modul
     emit_doc(w, s.doc.as_deref());
     if s.deprecated { w.line("#[deprecated]"); }
 
-    w.line("#[derive(Debug, Clone, PartialEq, Default)]");
+    let has_required_literal = s.fields.iter()
+        .any(|f| f.occurrence.is_required() && field_literal(f).is_some());
+    if has_required_literal {
+        w.line("#[derive(Debug, Clone, PartialEq)]");
+    } else {
+        w.line("#[derive(Debug, Clone, PartialEq, Default)]");
+    }
     w.line(&format!("pub struct {} {{", to_pascal_case(&s.name)));
     w.indent();
     for f in &s.fields {
         emit_doc(w, f.doc.as_deref());
         let ty_str = field_type_str(&f.ty, &f.occurrence, opts);
-        w.line(&format!("pub {}: {},", to_snake_case(&f.name), ty_str));
+        w.line(&format!("pub {}: {},", field_ident(&f.name), ty_str));
     }
     w.dedent();
     w.line("}");
+
+    // Literal fields default to their literal, so `Default` values decode again.
+    if has_required_literal {
+        w.blank();
+        w.line(&format!("impl Default for {} {{", to_pascal_case(&s.name)));
+        w.indent();
+        w.line("fn default() -> Self {");
+        w.indent();
+        w.line("Self {");
+        w.indent();
+        for f in &s.fields {
+            let val = match field_literal(f) {
+                Some(lit) if f.occurrence.is_required() => literal_value_expr(lit, opts.no_std),
+                _ => "Default::default()".into(),
+            };
+            w.line(&format!("{}: {val},", field_ident(&f.name)));
+        }
+        w.dedent();
+        w.line("}");
+        w.dedent();
+        w.line("}");
+        w.dedent();
+        w.line("}");
+    }
 
     w.blank();
     emit_struct_encode(w, s, opts);
@@ -176,7 +292,7 @@ fn emit_struct_encode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
     } else {
         let mut len_expr = format!("{}u64", req_count);
         for f in s.fields.iter().filter(|f| matches!(f.occurrence, Occurrence::Optional)) {
-            let fname = to_snake_case(&f.name);
+            let fname = field_ident(&f.name);
             len_expr.push_str(&format!(" + if self.{fname}.is_some() {{ 1 }} else {{ 0 }}"));
         }
         w.line(&format!("e.map({})?;", len_expr));
@@ -192,7 +308,7 @@ fn emit_struct_encode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
     };
 
     for f in &fields {
-        let field_access = format!("self.{}", to_snake_case(&f.name));
+        let field_access = format!("self.{}", field_ident(&f.name));
         if matches!(f.occurrence, Occurrence::Optional) {
             // Only emit key+value when the option is Some
             w.line(&format!("if let Some(ref v) = {} {{", field_access));
@@ -244,7 +360,7 @@ fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
             Occurrence::Optional => typeref_to_rust(&f.ty, opts),
             _ => field_type_str(&f.ty, &f.occurrence, opts),
         };
-        w.line(&format!("let mut {}: Option<{}> = None;", to_snake_case(&f.name), var_ty));
+        w.line(&format!("let mut {}: Option<{}> = None;", field_ident(&f.name), var_ty));
     }
     w.blank();
 
@@ -260,7 +376,7 @@ fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
     w.indent();
 
     for f in &s.fields {
-        let snake = to_snake_case(&f.name);
+        let snake = field_ident(&f.name);
         w.line(&format!("{:?} => {{", f.name.as_str()));
         w.indent();
         let decode_expr = decode_expr_for_in_module(&f.ty, opts, Some(module));
@@ -286,7 +402,7 @@ fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
     w.line("Ok(Self {");
     w.indent();
     for f in &s.fields {
-        let snake = to_snake_case(&f.name);
+        let snake = field_ident(&f.name);
         match &f.occurrence {
             Occurrence::Required => {
                 w.line(&format!(
@@ -376,9 +492,8 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
                 TypeRef::Primitive(Primitive::Float | Primitive::Float32 |
                                    Primitive::Float64 | Primitive::Float16) => "0.0".into(),
                 TypeRef::Primitive(Primitive::Tstr) => {
-                    // For string literal variants, use the literal string (lowercased name)
-                    let lit = v.name.as_str().to_lowercase().replace('_', "-");
-                    format!("{:?}.to_string()", lit)
+                    let lit = variant_str(v);
+                    if opts.no_std { format!("{lit:?}") } else { format!("{lit:?}.to_string()") }
                 }
                 TypeRef::Primitive(Primitive::Bstr | Primitive::Any) => "Vec::new()".into(),
                 TypeRef::Named(n) => format!("{}::default()", to_pascal_case(n)),
@@ -522,7 +637,7 @@ fn emit_enum_decode(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
         for v in &e.variants {
             if matches!(&v.ty, TypeRef::Primitive(Primitive::Tstr)) {
                 let vname    = to_pascal_case(&v.name);
-                let cddl_str = v.name.to_lowercase().replace('_', "-");
+                let cddl_str = variant_str(v);
                 let val: &str = if opts.no_std { "s" } else { "s.to_string()" };
                 w.line(&format!("{:?} => Ok({}::{}({val})),", cddl_str, enum_name, vname));
             }
@@ -602,7 +717,32 @@ fn emit_enum_decode(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
     }
 
     if has_map {
-        w.line("_ => Err(DecodeError::message(\"unsupported enum variant type\")),");
+        // Named variants (typically maps): try each in order on a probe decoder and
+        // commit the first that decodes, so literal fields discriminate the union.
+        w.line("_ => {");
+        w.indent();
+        for v in &e.variants {
+            if let TypeRef::Named(n) = &v.ty {
+                let vname = to_pascal_case(&v.name);
+                w.line("{");
+                w.indent();
+                w.line("let mut probe = d.clone();");
+                w.line(&format!(
+                    "if let Ok(inner) = <{} as Decode<'b, ()>>::decode(&mut probe, ctx) {{",
+                    to_pascal_case(n)
+                ));
+                w.indent();
+                w.line("*d = probe;");
+                w.line(&format!("return Ok({enum_name}::{vname}(inner));"));
+                w.dedent();
+                w.line("}");
+                w.dedent();
+                w.line("}");
+            }
+        }
+        w.line("Err(DecodeError::message(\"no enum variant matched\"))");
+        w.dedent();
+        w.line("}");
     } else {
         w.line("_ => Err(DecodeError::message(\"unexpected CBOR type for enum\")),");
     }
@@ -1092,9 +1232,12 @@ fn emit_struct_roundtrip(w: &mut IndentWriter, s: &StructDef, module: &IrModule,
     w.line(&format!("let original = {} {{", type_name));
     w.indent();
     for f in &s.fields {
-        let fname = to_snake_case(&f.name);
+        let fname = field_ident(&f.name);
         // For Named types that are constrained tstr aliases, use a valid string value.
         let val = match (&f.occurrence, &f.ty) {
+            (Occurrence::Required, _) if field_literal(f).is_some() => {
+                literal_value_expr(field_literal(f).expect("checked"), opts.no_std)
+            }
             (Occurrence::Required, TypeRef::Named(n)) => {
                 if let Some(v) = tstr_test_value_for(n, module) {
                     v
@@ -1154,8 +1297,7 @@ fn emit_enum_roundtrip(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions
         let var_test  = format!("roundtrip_{}_{}", to_snake_case(&e.name), v.name.to_lowercase().replace('-', "_"));
         let construct = match &v.ty {
             TypeRef::Primitive(Primitive::Tstr) => {
-                // Use variant name lowercased as the string value
-                let s = v.name.to_lowercase().replace('_', "-");
+                let s = variant_str(v);
                 format!("{}::{}({:?}.to_string())", type_name, vname, s)
             }
             TypeRef::Primitive(Primitive::Uint) => {
@@ -1427,8 +1569,8 @@ fn emit_module_json(module: &IrModule, opts: &CodegenOptions) -> String {
     for (name, def) in &module.types {
         w.blank();
         match def {
-            TypeDef::Struct(s) => emit_struct_json(&mut w, s, opts),
-            TypeDef::Enum(e)   => emit_enum_json(&mut w, e, opts),
+            TypeDef::Struct(s) => emit_struct_json(&mut w, s, opts, module),
+            TypeDef::Enum(e)   => emit_enum_json(&mut w, e, opts, module),
             TypeDef::Array(a)  => emit_array_json(&mut w, a, opts),
             TypeDef::Alias(a)  => emit_alias_json(&mut w, a, opts),
             TypeDef::Map(_)    => {
@@ -1470,19 +1612,81 @@ fn serde_field_attrs_json(fname_cddl: &str, fname_rust: &str, ty: &TypeRef, occ:
     }
 }
 
-fn emit_struct_json(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) {
+/// Emit a zero-sized JSON marker type for a single-literal member: it serializes
+/// as the literal and rejects any other value on decode. Struct fields such as
+/// `type: "SimStart"` use it, which lets an untagged union of structs pick the
+/// right variant instead of the first one whose shape fits.
+fn emit_literal_marker_json(w: &mut IndentWriter, name: &str, lit: &LiteralValue) {
+    let (value_ty, de_ty, value) = match lit {
+        LiteralValue::Text(t) => ("&'static str", "String", format!("{t:?}")),
+        LiteralValue::Uint(n) => ("u64", "u64", format!("{n}")),
+        LiteralValue::Int(n)  => ("i64", "i64", format!("{n}")),
+        LiteralValue::Bool(b) => ("bool", "bool", b.to_string()),
+        _ => return,
+    };
+    w.line(&format!("/// Always the literal `{value}`."));
+    w.line("#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]");
+    w.line(&format!("pub struct {name};"));
+    w.blank();
+    w.line(&format!("impl {name} {{"));
+    w.indent();
+    w.line("/// The literal value.");
+    w.line(&format!("pub const VALUE: {value_ty} = {value};"));
+    w.dedent();
+    w.line("}");
+    w.blank();
+    w.line(&format!("impl Serialize for {name} {{"));
+    w.indent();
+    w.line("fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {");
+    w.indent();
+    w.line("Self::VALUE.serialize(s)");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.blank();
+    w.line(&format!("impl<'de> Deserialize<'de> for {name} {{"));
+    w.indent();
+    w.line("fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {");
+    w.indent();
+    w.line(&format!("let v = <{de_ty}>::deserialize(d)?;"));
+    w.line("if v == Self::VALUE {");
+    w.indent();
+    w.line("Ok(Self)");
+    w.dedent();
+    w.line("} else {");
+    w.indent();
+    w.line("Err(serde::de::Error::custom(format!(\"expected {:?}, found {:?}\", Self::VALUE, v)))");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+}
+
+fn emit_struct_json(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions, module: &IrModule) {
     emit_doc(w, s.doc.as_deref());
     if s.deprecated { w.line("#[deprecated]"); }
 
+    let mut markers = Vec::new();
     w.line("#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]");
     w.line(&format!("pub struct {} {{", to_pascal_case(&s.name)));
     w.indent();
     for f in &s.fields {
         emit_doc(w, f.doc.as_deref());
-        let fname = to_snake_case(&f.name);
+        let fname = field_ident(&f.name);
         let attrs = serde_field_attrs_json(&f.name, &fname, &f.ty, &f.occurrence);
         if !attrs.is_empty() { w.line(&attrs); }
-        let ty_str = field_type_str(&f.ty, &f.occurrence, opts);
+        let ty_str = match field_literal(f) {
+            Some(lit) => {
+                let marker = marker_name(&s.name, &f.name, module);
+                let ty = if f.occurrence.is_required() { marker.clone() } else { format!("Option<{marker}>") };
+                markers.push((marker, lit.clone()));
+                ty
+            }
+            None => field_type_str(&f.ty, &f.occurrence, opts),
+        };
         w.line(&format!("pub {fname}: {ty_str},"));
     }
     w.dedent();
@@ -1505,80 +1709,94 @@ fn emit_struct_json(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) 
     w.line("}");
     w.dedent();
     w.line("}");
+
+    for (marker, lit) in &markers {
+        w.blank();
+        emit_literal_marker_json(w, marker, lit);
+    }
 }
 
-fn emit_enum_json(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions) {
+fn emit_enum_json(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions, module: &IrModule) {
     emit_doc(w, e.doc.as_deref());
     if e.deprecated { w.line("#[deprecated]"); }
 
     let type_name = to_pascal_case(&e.name);
 
-    // Detect enum kind: all string/null variants → simple rename; mixed → untagged
-    let all_unit = e.variants.iter().all(|v|
-        matches!(&v.ty, TypeRef::Primitive(Primitive::Null | Primitive::Tstr)));
+    // All string literals (and nulls) → a plain unit enum renamed to the literals.
+    // Anything else → untagged, with literal variants carried by marker types.
+    let unit_like = |v: &EnumVariant| {
+        matches!(&v.ty, TypeRef::Primitive(Primitive::Null)) || text_literal(v).is_some()
+    };
+    let all_unit = e.variants.iter().all(unit_like);
 
-    let first_is_unit = e.variants.first().map(|v|
-        matches!(&v.ty, TypeRef::Primitive(Primitive::Null))).unwrap_or(true);
-
-    if first_is_unit {
+    if all_unit {
         w.line("#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]");
-    } else {
-        w.line("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]");
-    }
-    if !all_unit {
-        w.line("#[serde(untagged)]");
-    }
-
-    w.line(&format!("pub enum {type_name} {{"));
-    w.indent();
-    for (i, v) in e.variants.iter().enumerate() {
-        let vname = to_pascal_case(&v.name);
-        if i == 0 && first_is_unit { w.line("#[default]"); }
-        // Rename unit variants to their CDDL string value
-        if matches!(&v.ty, TypeRef::Primitive(Primitive::Null | Primitive::Tstr)) {
-            let cddl_str = v.name.to_lowercase().replace('_', "-");
-            w.line(&format!("#[serde(rename = {:?})]", cddl_str));
-            w.line(&format!("{vname},"));
-        } else {
-            match &v.ty {
-                TypeRef::Primitive(Primitive::Null) => w.line(&format!("{vname},")),
-                TypeRef::Primitive(p) => {
-                    let rt = primitive_to_rust(p, false);
-                    w.line(&format!("{vname}({rt}),"));
-                }
-                TypeRef::Named(n) => {
-                    w.line(&format!("{vname}({}),", to_pascal_case(n)));
-                }
-                _ => w.line(&format!("{vname},")),
-            }
-        }
-    }
-    w.dedent();
-    w.line("}");
-
-    // Default impl if first variant holds data
-    if !first_is_unit {
-        if let Some(v) = e.variants.first() {
+        w.line(&format!("pub enum {type_name} {{"));
+        w.indent();
+        for (i, v) in e.variants.iter().enumerate() {
             let vname = to_pascal_case(&v.name);
+            if i == 0 { w.line("#[default]"); }
+            w.line(&format!("#[serde(rename = {:?})]", variant_str(v)));
+            w.line(&format!("{vname},"));
+        }
+        w.dedent();
+        w.line("}");
+    } else {
+        let mut markers = Vec::new();
+        w.line("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]");
+        w.line("#[serde(untagged)]");
+        w.line(&format!("pub enum {type_name} {{"));
+        w.indent();
+        let mut default_expr = None;
+        for v in &e.variants {
+            let vname = to_pascal_case(&v.name);
+            let (line, default) = if let Some(t) = text_literal(v) {
+                let marker = marker_name(&e.name, &v.name, module);
+                markers.push((marker.clone(), LiteralValue::Text(t.to_owned())));
+                (format!("{vname}({marker}),"), format!("{type_name}::{vname}({marker})"))
+            } else {
+                match &v.ty {
+                    TypeRef::Primitive(Primitive::Null) => (format!("{vname},"), format!("{type_name}::{vname}")),
+                    TypeRef::Primitive(p) => {
+                        let rt = primitive_to_rust(p, false);
+                        let di = match p {
+                            Primitive::Uint => "0u64".to_owned(),
+                            Primitive::Int  => "0i64".to_owned(),
+                            Primitive::Bool => "false".to_owned(),
+                            Primitive::Tstr => "String::new()".to_owned(),
+                            Primitive::Bstr | Primitive::Any => "Vec::new()".to_owned(),
+                            _ => "Default::default()".to_owned(),
+                        };
+                        (format!("{vname}({rt}),"), format!("{type_name}::{vname}({di})"))
+                    }
+                    TypeRef::Named(n) => {
+                        let tn = to_pascal_case(n);
+                        (format!("{vname}({tn}),"), format!("{type_name}::{vname}({tn}::default())"))
+                    }
+                    _ => (format!("{vname},"), format!("{type_name}::{vname}")),
+                }
+            };
+            w.line(&line);
+            default_expr.get_or_insert(default);
+        }
+        w.dedent();
+        w.line("}");
+
+        if let Some(di) = default_expr {
             w.blank();
             w.line(&format!("impl Default for {type_name} {{"));
             w.indent();
             w.line("fn default() -> Self {");
             w.indent();
-            let di = match &v.ty {
-                TypeRef::Primitive(Primitive::Uint) => "0u64".into(),
-                TypeRef::Primitive(Primitive::Int)  => "0i64".into(),
-                TypeRef::Primitive(Primitive::Bool) => "false".into(),
-                TypeRef::Primitive(Primitive::Tstr) => "String::new()".into(),
-                TypeRef::Primitive(Primitive::Bstr | Primitive::Any) => "Vec::new()".into(),
-                TypeRef::Named(n) => format!("{}::default()", to_pascal_case(n)),
-                _ => "Default::default()".into(),
-            };
-            w.line(&format!("{type_name}::{vname}({di})"));
+            w.line(&di);
             w.dedent();
             w.line("}");
             w.dedent();
             w.line("}");
+        }
+        for (marker, lit) in &markers {
+            w.blank();
+            emit_literal_marker_json(w, marker, lit);
         }
     }
 
@@ -1742,7 +1960,7 @@ fn emit_roundtrip_tests_json(module: &IrModule, opts: &CodegenOptions) -> String
     for (_, def) in &module.types {
         match def {
             TypeDef::Struct(s) => emit_struct_roundtrip_json(&mut w, s, opts),
-            TypeDef::Enum(e)   => emit_enum_roundtrip_json(&mut w, e),
+            TypeDef::Enum(e)   => emit_enum_roundtrip_json(&mut w, e, module),
             TypeDef::Alias(a)  => emit_alias_roundtrip_json(&mut w, a, opts),
             TypeDef::Array(a)  => emit_array_roundtrip_json(&mut w, a),
             TypeDef::Map(_)    => {}
@@ -1774,8 +1992,12 @@ fn emit_struct_roundtrip_json(w: &mut IndentWriter, s: &StructDef, opts: &Codege
     w.line(&format!("let original = {type_name} {{"));
     w.indent();
     for f in &s.fields {
-        let fname = to_snake_case(&f.name);
-        let val   = default_value_expr(&f.ty, &f.occurrence, opts);
+        let fname = field_ident(&f.name);
+        let val = if field_literal(f).is_some() {
+            "Default::default()".to_owned()
+        } else {
+            default_value_expr(&f.ty, &f.occurrence, opts)
+        };
         w.line(&format!("{fname}: {val},"));
     }
     w.dedent();
@@ -1787,7 +2009,7 @@ fn emit_struct_roundtrip_json(w: &mut IndentWriter, s: &StructDef, opts: &Codege
     w.line("}");
 }
 
-fn emit_enum_roundtrip_json(w: &mut IndentWriter, e: &EnumDef) {
+fn emit_enum_roundtrip_json(w: &mut IndentWriter, e: &EnumDef, module: &IrModule) {
     let type_name = to_pascal_case(&e.name);
     let test_name = format!("roundtrip_{}", to_snake_case(&e.name));
 
@@ -1801,13 +2023,19 @@ fn emit_enum_roundtrip_json(w: &mut IndentWriter, e: &EnumDef) {
     w.dedent();
     w.line("}");
 
+    let all_unit = e.variants.iter().all(|v| {
+        matches!(&v.ty, TypeRef::Primitive(Primitive::Null)) || text_literal(v).is_some()
+    });
     for v in &e.variants {
         let vname    = to_pascal_case(&v.name);
         let var_test = format!("roundtrip_{}_{}", to_snake_case(&e.name), v.name.to_lowercase().replace('-', "_"));
         let construct = match &v.ty {
+            _ if text_literal(v).is_some() && all_unit => format!("{type_name}::{vname}"),
+            _ if text_literal(v).is_some() => {
+                format!("{type_name}::{vname}({})", marker_name(&e.name, &v.name, module))
+            }
             TypeRef::Primitive(Primitive::Tstr) => {
-                let s = v.name.to_lowercase().replace('_', "-");
-                format!("{}::{}({:?}.to_string())", type_name, vname, s)
+                format!("{}::{}({:?}.to_string())", type_name, vname, "hello")
             }
             TypeRef::Primitive(Primitive::Uint) => format!("{}::{}(0u64)", type_name, vname),
             TypeRef::Primitive(Primitive::Int)  => format!("{}::{}(0i64)", type_name, vname),
