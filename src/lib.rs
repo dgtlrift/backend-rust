@@ -1912,7 +1912,7 @@ fn emit_alias_json(w: &mut IndentWriter, a: &AliasDef, opts: &CodegenOptions) {
         w.blank();
         w.line(&format!("impl {type_name} {{"));
         w.indent();
-        w.line("pub fn new(val: impl Into<{inner_ty}>) -> Result<Self, String> {");
+        w.line(&format!("pub fn new(val: impl Into<{inner_ty}>) -> Result<Self, String> {{"));
         w.indent();
         w.line("let inner = val.into();");
         for c in &a.constraints {
