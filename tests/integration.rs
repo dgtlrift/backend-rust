@@ -506,3 +506,37 @@ fn test_json_optional_bstr_defaults_when_absent() {
         out.lib_rs
     );
 }
+
+// ── Byte strings in every serde format ────────────────────────────────────────
+
+#[test]
+fn test_json_bytes_follow_the_format() {
+    let out = compile_with_opts("op = { data: bstr }", json_opts());
+    assert!(out.lib_rs.contains("if s.is_human_readable() {"), "{}", out.lib_rs);
+    assert!(out.lib_rs.contains("s.serialize_bytes(v)"));
+    assert!(out.lib_rs.contains("d.deserialize_byte_buf(BytesVisitor)"));
+    assert!(out.lib_rs.contains("with = \"base64url_serde\""));
+}
+
+#[test]
+fn test_json_bytes_through_aliases_arrays_and_variants() {
+    let src = "rec = { id: key, reads: reads, ? more: reads, value: val }\n\
+               key = bstr\n\
+               reads = [* bstr]\n\
+               val = uint / bstr\n";
+    let out = compile_with_opts(src, json_opts());
+    // A plain alias of bstr serializes as bytes too.
+    assert!(out.lib_rs.contains("#[serde(with = \"base64url_serde\")]\n    pub id:"), "{}", out.lib_rs);
+    assert!(out.lib_rs.contains("#[serde(with = \"base64url_serde::vec\")]"));
+    assert!(out.lib_rs.contains("with = \"base64url_serde::vec_option\", default"));
+    assert!(out.lib_rs.contains("(#[serde(with = \"base64url_serde\")] Vec<u8>),"));
+    // The array alias's own helpers go through the wrappers.
+    assert!(out.lib_rs.contains("base64url_serde::BytesRef(b)"));
+}
+
+#[test]
+fn test_json_roundtrips_also_go_through_cbor() {
+    let out = compile_with_opts("op = { data: bstr }", json_opts());
+    assert!(out.roundtrip_rs.contains("ciborium::into_writer(&original, &mut cbor)"));
+    assert!(out.cargo_toml.contains("ciborium = \"0.2\""));
+}
