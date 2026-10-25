@@ -30,6 +30,12 @@ const RUST_KEYWORDS: &[&str] = &[
 /// (`type` → `r#type`), except those that cannot be raw (`self`, `Self`, `super`,
 /// `crate`), which get a trailing underscore. Serde derives strip the `r#`, and the
 /// JSON backend adds an explicit rename whenever the identifier differs.
+/// The decoder's local variable for a field: prefixed, so a field named like one of the
+/// decoder's own locals (`d`, `ctx`, `len`, `i`, `key`, `val`) can't shadow it.
+fn field_local(name: &str) -> String {
+    format!("f_{}", field_ident(name).trim_start_matches("r#"))
+}
+
 fn field_ident(name: &str) -> String {
     let snake = to_snake_case(name);
     if !RUST_KEYWORDS.contains(&snake.as_str()) {
@@ -360,7 +366,7 @@ fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
             Occurrence::Optional => typeref_to_rust(&f.ty, opts),
             _ => field_type_str(&f.ty, &f.occurrence, opts),
         };
-        w.line(&format!("let mut {}: Option<{}> = None;", field_ident(&f.name), var_ty));
+        w.line(&format!("let mut {}: Option<{}> = None;", field_local(&f.name), var_ty));
     }
     w.blank();
 
@@ -376,7 +382,7 @@ fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
     w.indent();
 
     for f in &s.fields {
-        let snake = field_ident(&f.name);
+        let local = field_local(&f.name);
         w.line(&format!("{:?} => {{", f.name.as_str()));
         w.indent();
         let decode_expr = decode_expr_for_in_module(&f.ty, opts, Some(module));
@@ -385,7 +391,7 @@ fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
         // Inline validation
         emit_field_validation(w, &f.constraints, "val", &f.name);
 
-        w.line(&format!("{snake} = Some(val);"));
+        w.line(&format!("{local} = Some(val);"));
         w.dedent();
         w.line("}");
     }
@@ -403,19 +409,20 @@ fn emit_struct_decode(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions
     w.indent();
     for f in &s.fields {
         let snake = field_ident(&f.name);
+        let local = field_local(&f.name);
         match &f.occurrence {
             Occurrence::Required => {
                 w.line(&format!(
-                    "{snake}: {snake}.ok_or_else(|| DecodeError::message(\"missing field '{}'\" ))?,",
+                    "{snake}: {local}.ok_or_else(|| DecodeError::message(\"missing field '{}'\" ))?,",
                     f.name
                 ));
             }
             Occurrence::Optional => {
-                w.line(&format!("{snake},"));
+                w.line(&format!("{snake}: {local},"));
             }
             _ => {
                 w.line(&format!(
-                    "{snake}: {snake}.unwrap_or_default(),",
+                    "{snake}: {local}.unwrap_or_default(),",
                 ));
             }
         }
@@ -763,6 +770,12 @@ fn emit_array(w: &mut IndentWriter, a: &ArrayDef, opts: &CodegenOptions) {
 
     let type_name = to_pascal_case(&a.name);
     let elem_ty   = typeref_to_rust(&a.element, opts);
+    // minicbor encodes a `Vec<u8>` element as an array of integers; `ByteVec` is a bstr.
+    let heap_elem_ty = if is_bstr(&a.element) {
+        "minicbor::bytes::ByteVec".to_owned()
+    } else {
+        elem_ty.clone()
+    };
     let cap       = capacity_value(
         a.occurrence.capacity().unwrap_or(&Capacity::Bounded(opts.max_array)),
         opts.max_array,
@@ -773,13 +786,22 @@ fn emit_array(w: &mut IndentWriter, a: &ArrayDef, opts: &CodegenOptions) {
     // include!()'d into a crate that doesn't declare the "no-std" feature.
     w.line("#[allow(unexpected_cfgs)]");
     w.line("#[cfg(not(feature = \"no-std\"))]");
-    w.line(&format!("pub type {} = Vec<{}>;", type_name, elem_ty));
+    w.line(&format!("pub type {} = Vec<{}>;", type_name, heap_elem_ty));
     w.line("#[allow(unexpected_cfgs)]");
     w.line("#[cfg(feature = \"no-std\")]");
     w.line(&format!(
         "pub type {} = heapless::Vec<{}, {}>;",
         type_name, elem_ty, cap
     ));
+}
+
+/// Whether a type is a byte string (`bstr`, possibly tagged).
+fn is_bstr(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::Primitive(Primitive::Bstr) => true,
+        TypeRef::Tagged(_, inner) => is_bstr(inner),
+        _ => false,
+    }
 }
 
 // ── Alias ─────────────────────────────────────────────────────────────────────
@@ -1166,7 +1188,9 @@ fn emit_cargo_toml(crate_name: &str, opts: &CodegenOptions) -> String {
         s.push_str("heapless = { version = \"0.8\", optional = true }\n");
         s.push('\n');
         s.push_str("[features]\n");
-        s.push_str("default = []\n");
+        // Outside no-std the types are `Vec` and `String`, which need minicbor's alloc.
+        s.push_str("default = [\"alloc\"]\n");
+        s.push_str("alloc   = [\"minicbor/alloc\"]\n");
         s.push_str("no-std  = [\"heapless\"]\n");
         s.push('\n');
         s.push_str("[dev-dependencies]\n");
@@ -1597,7 +1621,12 @@ fn serde_field_attrs_json(fname_cddl: &str, fname_rust: &str, ty: &TypeRef, occ:
     let is_bytes = is_bytes_type(ty) || matches!(ty, TypeRef::Primitive(Primitive::Bstr | Primitive::Any));
     if is_bytes {
         match occ {
-            Occurrence::Optional => attrs.push("with = \"base64url_serde::option\"".into()),
+            // `with` disables serde's implicit default for `Option`, so an absent field
+            // would fail to decode without `default`.
+            Occurrence::Optional => {
+                attrs.push("with = \"base64url_serde::option\"".into());
+                attrs.push("default".into());
+            }
             _ => attrs.push("with = \"base64url_serde\"".into()),
         }
     }
