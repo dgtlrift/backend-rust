@@ -1183,6 +1183,10 @@ fn emit_cargo_toml(crate_name: &str, opts: &CodegenOptions) -> String {
         s.push_str("serde      = { version = \"1\", features = [\"derive\"] }\n");
         s.push_str("serde_json = \"1\"\n");
         s.push_str("base64     = \"0.22\"\n");
+        s.push('\n');
+        s.push_str("[dev-dependencies]\n");
+        s.push_str("# The round-trip tests also go through CBOR.\n");
+        s.push_str("ciborium = \"0.2\"\n");
     } else {
         s.push_str("minicbor = { version = \">=2\", features = [\"derive\"] }\n");
         s.push_str("heapless = { version = \"0.8\", optional = true }\n");
@@ -1539,55 +1543,125 @@ fn emit_module_json(module: &IrModule, opts: &CodegenOptions) -> String {
     w.line("use serde::{Deserialize, Serialize};");
     w.blank();
 
-    // base64url serde helper module (needed for bstr/any fields)
+    w.line("/// Byte strings (`bstr`), in the form each serde format expects.");
+    w.line("///");
+    w.line("/// Human-readable formats such as JSON get base64url text (RFC 8949 section 6.1), binary");
+    w.line("/// ones such as CBOR a native byte string. Decoding accepts both, as serde's buffering for");
+    w.line("/// untagged enums reports itself human-readable in any format.");
+    w.line("#[allow(dead_code)]");
     w.line("mod base64url_serde {");
-    w.indent();
-    w.line("use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};");
-    w.line("use serde::{Deserialize, Deserializer, Serializer};");
+    w.line("    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};");
+    w.line("    use serde::{Deserialize, Deserializer, Serialize, Serializer, de};");
     w.blank();
-    w.line("pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {");
-    w.indent();
-    w.line("s.serialize_str(&URL_SAFE_NO_PAD.encode(v))");
-    w.dedent();
-    w.line("}");
+    w.line("    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {");
+    w.line("        if s.is_human_readable() {");
+    w.line("            s.serialize_str(&URL_SAFE_NO_PAD.encode(v))");
+    w.line("        } else {");
+    w.line("            s.serialize_bytes(v)");
+    w.line("        }");
+    w.line("    }");
     w.blank();
-    w.line("pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {");
-    w.indent();
-    w.line("let s = String::deserialize(d)?;");
-    w.line("URL_SAFE_NO_PAD.decode(&s).map_err(serde::de::Error::custom)");
-    w.dedent();
-    w.line("}");
+    w.line("    struct BytesVisitor;");
     w.blank();
-    w.line("pub mod option {");
-    w.indent();
-    w.line("use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};");
-    w.line("use serde::{Deserialize, Deserializer, Serializer};");
+    w.line("    impl<'de> de::Visitor<'de> for BytesVisitor {");
+    w.line("        type Value = Vec<u8>;");
     w.blank();
-    w.line("pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {");
-    w.indent();
-    w.line("match v {");
-    w.indent();
-    w.line("Some(bytes) => s.serialize_str(&URL_SAFE_NO_PAD.encode(bytes)),");
-    w.line("None => s.serialize_none(),");
-    w.dedent();
-    w.line("}");
-    w.dedent();
-    w.line("}");
+    w.line("        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {");
+    w.line("            f.write_str(\"a byte string, or base64url text\")");
+    w.line("        }");
     w.blank();
-    w.line("pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {");
-    w.indent();
-    w.line("let s = Option::<String>::deserialize(d)?;");
-    w.line("match s {");
-    w.indent();
-    w.line("Some(s) => Ok(Some(URL_SAFE_NO_PAD.decode(&s).map_err(serde::de::Error::custom)?)),");
-    w.line("None => Ok(None),");
-    w.dedent();
-    w.line("}");
-    w.dedent();
-    w.line("}");
-    w.dedent();
-    w.line("}");
-    w.dedent();
+    w.line("        fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<u8>, E> {");
+    w.line("            URL_SAFE_NO_PAD.decode(v).map_err(E::custom)");
+    w.line("        }");
+    w.blank();
+    w.line("        fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {");
+    w.line("            Ok(v.to_vec())");
+    w.line("        }");
+    w.blank();
+    w.line("        fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {");
+    w.line("            Ok(v)");
+    w.line("        }");
+    w.line("    }");
+    w.blank();
+    w.line("    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {");
+    w.line("        if d.is_human_readable() {");
+    w.line("            d.deserialize_str(BytesVisitor)");
+    w.line("        } else {");
+    w.line("            d.deserialize_byte_buf(BytesVisitor)");
+    w.line("        }");
+    w.line("    }");
+    w.blank();
+    w.line("    /// A byte string borrowed for serializing.");
+    w.line("    pub struct BytesRef<'a>(pub &'a [u8]);");
+    w.blank();
+    w.line("    impl Serialize for BytesRef<'_> {");
+    w.line("        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {");
+    w.line("            serialize(self.0, s)");
+    w.line("        }");
+    w.line("    }");
+    w.blank();
+    w.line("    /// A byte string owned after deserializing.");
+    w.line("    pub struct Bytes(pub Vec<u8>);");
+    w.blank();
+    w.line("    impl<'de> Deserialize<'de> for Bytes {");
+    w.line("        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {");
+    w.line("            deserialize(d).map(Bytes)");
+    w.line("        }");
+    w.line("    }");
+    w.blank();
+    w.line("    /// `Option<bstr>`.");
+    w.line("    pub mod option {");
+    w.line("        use serde::{Deserialize, Deserializer, Serializer};");
+    w.blank();
+    w.line("        pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {");
+    w.line("            match v {");
+    w.line("                Some(bytes) => s.serialize_some(&super::BytesRef(bytes)),");
+    w.line("                None => s.serialize_none(),");
+    w.line("            }");
+    w.line("        }");
+    w.blank();
+    w.line("        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {");
+    w.line("            Ok(Option::<super::Bytes>::deserialize(d)?.map(|b| b.0))");
+    w.line("        }");
+    w.line("    }");
+    w.blank();
+    w.line("    /// `[* bstr]`.");
+    w.line("    pub mod vec {");
+    w.line("        use serde::{Deserialize, Deserializer, Serializer};");
+    w.blank();
+    w.line("        pub fn serialize<S: Serializer>(v: &[Vec<u8>], s: S) -> Result<S::Ok, S::Error> {");
+    w.line("            s.collect_seq(v.iter().map(|b| super::BytesRef(b)))");
+    w.line("        }");
+    w.blank();
+    w.line("        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {");
+    w.line("            Ok(Vec::<super::Bytes>::deserialize(d)?.into_iter().map(|b| b.0).collect())");
+    w.line("        }");
+    w.line("    }");
+    w.blank();
+    w.line("    /// `Option<[* bstr]>`.");
+    w.line("    pub mod vec_option {");
+    w.line("        use serde::{Deserialize, Deserializer, Serialize, Serializer};");
+    w.blank();
+    w.line("        struct Seq<'a>(&'a [Vec<u8>]);");
+    w.blank();
+    w.line("        impl Serialize for Seq<'_> {");
+    w.line("            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {");
+    w.line("                super::vec::serialize(self.0, s)");
+    w.line("            }");
+    w.line("        }");
+    w.blank();
+    w.line("        pub fn serialize<S: Serializer>(v: &Option<Vec<Vec<u8>>>, s: S) -> Result<S::Ok, S::Error> {");
+    w.line("            match v {");
+    w.line("                Some(items) => s.serialize_some(&Seq(items)),");
+    w.line("                None => s.serialize_none(),");
+    w.line("            }");
+    w.line("        }");
+    w.blank();
+    w.line("        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<Vec<u8>>>, D::Error> {");
+    w.line("            let v = Option::<Vec<super::Bytes>>::deserialize(d)?;");
+    w.line("            Ok(v.map(|items| items.into_iter().map(|b| b.0).collect()))");
+    w.line("        }");
+    w.line("    }");
     w.line("}");
 
     for (name, def) in &module.types {
@@ -1595,7 +1669,7 @@ fn emit_module_json(module: &IrModule, opts: &CodegenOptions) -> String {
         match def {
             TypeDef::Struct(s) => emit_struct_json(&mut w, s, opts, module),
             TypeDef::Enum(e)   => emit_enum_json(&mut w, e, opts, module),
-            TypeDef::Array(a)  => emit_array_json(&mut w, a, opts),
+            TypeDef::Array(a)  => emit_array_json(&mut w, a, opts, module),
             TypeDef::Alias(a)  => emit_alias_json(&mut w, a, opts),
             TypeDef::Map(_)    => {
                 w.line(&format!("// Map type '{}' — use ArrayDef for open maps", name));
@@ -1610,24 +1684,72 @@ fn is_bytes_type(ty: &TypeRef) -> bool {
     matches!(ty, TypeRef::Primitive(Primitive::Bstr | Primitive::Any))
 }
 
-fn serde_field_attrs_json(fname_cddl: &str, fname_rust: &str, ty: &TypeRef, occ: &Occurrence) -> String {
+/// How a type holds byte strings, for the `base64url_serde` helpers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ByteShape {
+    /// One `bstr`.
+    One,
+    /// An array of them, `[* bstr]`.
+    Many,
+}
+
+/// Whether `ty` is a byte string, directly or through plain aliases, or an array of them.
+/// A constrained or tagged `bstr` alias is a newtype that serializes itself, so it is `None`.
+fn byte_shape(ty: &TypeRef, module: &IrModule) -> Option<ByteShape> {
+    match ty {
+        TypeRef::Primitive(Primitive::Bstr | Primitive::Any) => Some(ByteShape::One),
+        TypeRef::Tagged(_, inner) => byte_shape(inner, module),
+        TypeRef::Named(n) => match module.get(n) {
+            Some(TypeDef::Alias(a)) if a.constraints.is_empty() && a.tagged.is_none() => {
+                byte_shape(&a.ty, module)
+            }
+            Some(TypeDef::Array(a)) if byte_shape(&a.element, module) == Some(ByteShape::One) => {
+                Some(ByteShape::Many)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The `with` module for a byte-string member of `shape` and occurrence `occ`, and whether
+/// it needs `default` (an `Option` with `with` loses serde's implicit default).
+fn bytes_with(shape: ByteShape, occ: &Occurrence) -> (&'static str, bool) {
+    let optional = matches!(occ, Occurrence::Optional);
+    let repeated = matches!(
+        occ,
+        Occurrence::ZeroOrMore { .. } | Occurrence::OneOrMore { .. } | Occurrence::Bounded { .. }
+    );
+    match (shape, optional, repeated) {
+        (ByteShape::One, true, _) => ("base64url_serde::option", true),
+        (ByteShape::One, false, false) => ("base64url_serde", false),
+        (ByteShape::One, false, true) | (ByteShape::Many, false, false) => ("base64url_serde::vec", false),
+        (ByteShape::Many, true, _) => ("base64url_serde::vec_option", true),
+        (ByteShape::Many, false, true) => ("base64url_serde::vec", false),
+    }
+}
+
+fn serde_field_attrs_json(
+    fname_cddl: &str,
+    fname_rust: &str,
+    ty: &TypeRef,
+    occ: &Occurrence,
+    module: &IrModule,
+) -> String {
     let mut attrs = Vec::new();
     // Rename if CDDL name differs from snake_case Rust name
     let cddl_snake = to_snake_case(fname_cddl);
     if fname_cddl != cddl_snake || fname_cddl != fname_rust {
         attrs.push(format!("rename = {:?}", fname_cddl));
     }
-    // Bytes serialization
-    let is_bytes = is_bytes_type(ty) || matches!(ty, TypeRef::Primitive(Primitive::Bstr | Primitive::Any));
-    if is_bytes {
-        match occ {
+    // Byte strings: base64url in JSON, native in CBOR (see `base64url_serde`).
+    if let Some(shape) = byte_shape(ty, module) {
+        let (with, default) = bytes_with(shape, occ);
+        attrs.push(format!("with = {with:?}"));
+        if default {
             // `with` disables serde's implicit default for `Option`, so an absent field
             // would fail to decode without `default`.
-            Occurrence::Optional => {
-                attrs.push("with = \"base64url_serde::option\"".into());
-                attrs.push("default".into());
-            }
-            _ => attrs.push("with = \"base64url_serde\"".into()),
+            attrs.push("default".into());
         }
     }
     // Skip None for optional
@@ -1705,7 +1827,7 @@ fn emit_struct_json(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions, 
     for f in &s.fields {
         emit_doc(w, f.doc.as_deref());
         let fname = field_ident(&f.name);
-        let attrs = serde_field_attrs_json(&f.name, &fname, &f.ty, &f.occurrence);
+        let attrs = serde_field_attrs_json(&f.name, &fname, &f.ty, &f.occurrence, module);
         if !attrs.is_empty() { w.line(&attrs); }
         let ty_str = match field_literal(f) {
             Some(lit) => {
@@ -1796,11 +1918,19 @@ fn emit_enum_json(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions, mod
                             Primitive::Bstr | Primitive::Any => "Vec::new()".to_owned(),
                             _ => "Default::default()".to_owned(),
                         };
-                        (format!("{vname}({rt}),"), format!("{type_name}::{vname}({di})"))
+                        let attr = match byte_shape(&v.ty, module) {
+                            Some(shape) => format!("#[serde(with = {:?})] ", bytes_with(shape, &Occurrence::Required).0),
+                            None => String::new(),
+                        };
+                        (format!("{vname}({attr}{rt}),"), format!("{type_name}::{vname}({di})"))
                     }
                     TypeRef::Named(n) => {
                         let tn = to_pascal_case(n);
-                        (format!("{vname}({tn}),"), format!("{type_name}::{vname}({tn}::default())"))
+                        let attr = match byte_shape(&v.ty, module) {
+                            Some(shape) => format!("#[serde(with = {:?})] ", bytes_with(shape, &Occurrence::Required).0),
+                            None => String::new(),
+                        };
+                        (format!("{vname}({attr}{tn}),"), format!("{type_name}::{vname}({tn}::default())"))
                     }
                     _ => (format!("{vname},"), format!("{type_name}::{vname}")),
                 }
@@ -1847,24 +1977,35 @@ fn emit_enum_json(w: &mut IndentWriter, e: &EnumDef, _opts: &CodegenOptions, mod
     w.line("}");
 }
 
-fn emit_array_json(w: &mut IndentWriter, a: &ArrayDef, opts: &CodegenOptions) {
+fn emit_array_json(w: &mut IndentWriter, a: &ArrayDef, opts: &CodegenOptions, module: &IrModule) {
     emit_doc(w, a.doc.as_deref());
     if a.deprecated { w.line("#[deprecated]"); }
 
     let type_name = to_pascal_case(&a.name);
     let elem_ty   = typeref_to_rust(&a.element, opts);
+    let bytes     = byte_shape(&a.element, module) == Some(ByteShape::One);
 
     w.line(&format!("pub type {type_name} = Vec<{elem_ty}>;"));
     w.blank();
     w.line(&format!("pub fn encode_{type_name}(val: &{type_name}) -> Vec<u8> {{"));
     w.indent();
-    w.line("serde_json::to_vec(val).expect(\"encode\")");
+    if bytes {
+        w.line("let items: Vec<_> = val.iter().map(|b| base64url_serde::BytesRef(b)).collect();");
+        w.line("serde_json::to_vec(&items).expect(\"encode\")");
+    } else {
+        w.line("serde_json::to_vec(val).expect(\"encode\")");
+    }
     w.dedent();
     w.line("}");
     w.blank();
     w.line(&format!("pub fn decode_{type_name}(data: &[u8]) -> Result<{type_name}, serde_json::Error> {{"));
     w.indent();
-    w.line("serde_json::from_slice(data)");
+    if bytes {
+        w.line("let items: Vec<base64url_serde::Bytes> = serde_json::from_slice(data)?;");
+        w.line("Ok(items.into_iter().map(|b| b.0).collect())");
+    } else {
+        w.line("serde_json::from_slice(data)");
+    }
     w.dedent();
     w.line("}");
 }
@@ -1981,7 +2122,7 @@ fn emit_roundtrip_tests_json(module: &IrModule, opts: &CodegenOptions) -> String
     let crate_name = format!("{}_json", module.name.replace('-', "_"));
 
     w.line("// @generated by cddlc — do not edit manually");
-    w.line("// Roundtrip encode/decode tests (JSON)");
+    w.line("// Roundtrip encode/decode tests: JSON, and CBOR through ciborium");
     w.blank();
     w.line(&format!("use {}::*;", crate_name));
     w.blank();
@@ -2000,6 +2141,14 @@ fn emit_roundtrip_tests_json(module: &IrModule, opts: &CodegenOptions) -> String
     w.finish()
 }
 
+/// The CBOR half of a round trip: `original` through ciborium and back.
+fn emit_cbor_roundtrip(w: &mut IndentWriter, type_name: &str) {
+    w.line("let mut cbor = Vec::new();");
+    w.line("ciborium::into_writer(&original, &mut cbor).expect(\"encode cbor\");");
+    w.line(&format!("let decoded: {type_name} = ciborium::from_reader(cbor.as_slice()).expect(\"decode cbor\");"));
+    w.line("assert_eq!(original, decoded);");
+}
+
 fn emit_struct_roundtrip_json(w: &mut IndentWriter, s: &StructDef, opts: &CodegenOptions) {
     let type_name = to_pascal_case(&s.name);
     let test_name = format!("roundtrip_{}", to_snake_case(&s.name));
@@ -2011,6 +2160,7 @@ fn emit_struct_roundtrip_json(w: &mut IndentWriter, s: &StructDef, opts: &Codege
     w.line("let buf = original.encode();");
     w.line(&format!("let decoded = {type_name}::decode(&buf).expect(\"decode\");"));
     w.line("assert_eq!(original, decoded);");
+    emit_cbor_roundtrip(w, &type_name);
     w.dedent();
     w.line("}");
     w.blank();
@@ -2034,6 +2184,7 @@ fn emit_struct_roundtrip_json(w: &mut IndentWriter, s: &StructDef, opts: &Codege
     w.line("let buf = original.encode();");
     w.line(&format!("let decoded = {type_name}::decode(&buf).expect(\"decode\");"));
     w.line("assert_eq!(original, decoded);");
+    emit_cbor_roundtrip(w, &type_name);
     w.dedent();
     w.line("}");
 }
@@ -2049,6 +2200,7 @@ fn emit_enum_roundtrip_json(w: &mut IndentWriter, e: &EnumDef, module: &IrModule
     w.line("let buf = original.encode();");
     w.line(&format!("let decoded = {type_name}::decode(&buf).expect(\"decode\");"));
     w.line("assert_eq!(original, decoded);");
+    emit_cbor_roundtrip(w, &type_name);
     w.dedent();
     w.line("}");
 
@@ -2099,6 +2251,7 @@ fn emit_alias_roundtrip_json(w: &mut IndentWriter, a: &AliasDef, opts: &CodegenO
     w.line("let buf = original.encode();");
     w.line(&format!("let decoded = {type_name}::decode(&buf).expect(\"decode\");"));
     w.line("assert_eq!(original, decoded);");
+    emit_cbor_roundtrip(w, &type_name);
     w.dedent();
     w.line("}");
 
