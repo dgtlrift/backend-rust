@@ -496,3 +496,13 @@ fn test_cargo_toml_alloc_by_default() {
     assert!(g.cargo_toml.contains("default = [\"alloc\"]"));
     assert!(g.cargo_toml.contains("alloc   = [\"minicbor/alloc\"]"));
 }
+
+#[test]
+fn test_json_optional_bstr_defaults_when_absent() {
+    let out = compile_with_opts("op = { ? out: bstr }", json_opts());
+    assert!(
+        out.lib_rs.contains("with = \"base64url_serde::option\", default"),
+        "{}",
+        out.lib_rs
+    );
+}

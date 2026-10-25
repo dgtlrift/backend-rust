@@ -1621,7 +1621,12 @@ fn serde_field_attrs_json(fname_cddl: &str, fname_rust: &str, ty: &TypeRef, occ:
     let is_bytes = is_bytes_type(ty) || matches!(ty, TypeRef::Primitive(Primitive::Bstr | Primitive::Any));
     if is_bytes {
         match occ {
-            Occurrence::Optional => attrs.push("with = \"base64url_serde::option\"".into()),
+            // `with` disables serde's implicit default for `Option`, so an absent field
+            // would fail to decode without `default`.
+            Occurrence::Optional => {
+                attrs.push("with = \"base64url_serde::option\"".into());
+                attrs.push("default".into());
+            }
             _ => attrs.push("with = \"base64url_serde\"".into()),
         }
     }
