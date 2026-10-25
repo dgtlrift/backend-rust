@@ -462,3 +462,37 @@ fn test_json_constrained_alias_constructor() {
     let out = compile_with_opts("hex = tstr .size 4", json_opts());
     assert!(out.lib_rs.contains("pub fn new(val: impl Into<String>) -> Result<Self, String> {"), "{}", out.lib_rs);
 }
+
+// ── Heap (non no-std) decoding ────────────────────────────────────────────────
+
+#[test]
+fn test_decoder_locals_cannot_be_shadowed_by_fields() {
+    // Fields named like the decoder's own locals must not shadow them.
+    let g = compile("op = { len: uint, d: uint, key: tstr, i: uint }");
+    assert!(g.lib_rs.contains("let mut f_len: Option<u64> = None;"));
+    assert!(g.lib_rs.contains("let mut f_d: Option<u64> = None;"));
+    assert!(g.lib_rs.contains("f_len = Some(val);"));
+    assert!(g.lib_rs.contains("len: f_len.ok_or_else("));
+}
+
+#[test]
+fn test_keyword_field_local_has_no_raw_prefix() {
+    let g = compile("rec = { type: tstr }");
+    assert!(g.lib_rs.contains("let mut f_type: Option<String> = None;"));
+    assert!(g.lib_rs.contains("r#type: f_type.ok_or_else("));
+}
+
+#[test]
+fn test_bstr_array_elements_are_byte_strings() {
+    // minicbor encodes Vec<u8> as an array of integers; elements must be ByteVec.
+    let g = compile("reads = [* bstr]");
+    assert!(g.lib_rs.contains("pub type Reads = Vec<minicbor::bytes::ByteVec>;"));
+    assert!(g.lib_rs.contains("pub type Reads = heapless::Vec<"));
+}
+
+#[test]
+fn test_cargo_toml_alloc_by_default() {
+    let g = compile("device-id = uint");
+    assert!(g.cargo_toml.contains("default = [\"alloc\"]"));
+    assert!(g.cargo_toml.contains("alloc   = [\"minicbor/alloc\"]"));
+}
